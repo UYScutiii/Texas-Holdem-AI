@@ -48,7 +48,7 @@ class RLBot:
     Learns by playing games and updating policy based on rewards.
     """
     
-    def __init__(self, model_path="bots/models/rl_model.pt", device="cpu", 
+    def __init__(self, model_path="models/rl_model.pt", device="cpu",
                  learning_rate=1e-4, training_mode=False, exploration_rate=0.1, use_fallback=True):
         self.device = device
         self.training_mode = training_mode
@@ -439,7 +439,7 @@ class RLBot:
         # Reset episode
         self.current_episode = []
     
-    def save_model(self, path="bots/models/rl_model.pt"):
+    def save_model(self, path="models/rl_model.pt"):
         """Save the trained model."""
         import os
         os.makedirs(os.path.dirname(path), exist_ok=True)

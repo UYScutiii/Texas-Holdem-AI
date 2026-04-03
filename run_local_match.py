@@ -123,8 +123,8 @@ def plot_tournament_progress(chip_history, player_ids):
     plt.tight_layout()
     
     # Save the plot
-    plt.savefig('tournament_progress.png', dpi=150, bbox_inches='tight')
-    print(f"\nChart saved as 'tournament_progress.png'")
+    plt.savefig('output/tournament_progress.png', dpi=150, bbox_inches='tight')
+    print(f"\nChart saved as 'output/tournament_progress.png'")
     
     # Show the plot
     plt.show()

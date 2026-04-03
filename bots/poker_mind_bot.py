@@ -107,11 +107,16 @@ class SmartBot:
         return Action("fold")
 
     def _raise_or_call(self, legal, pot):
-        """Raise about 50% pot if possible, else call."""
+        """Raise about 50% pot if possible, else call. Cap at 25% of stack."""
         for a in legal:
             if a["type"] in ("raise", "bet"):
-                size = max(a["min"], min(a["max"], pot * 0.5))
-                return Action(a["type"], size)
+                # Cap raise to avoid all-in escalation on marginal spots
+                stack_cap = a["max"] * 0.25
+                size = max(a["min"], min(a["max"], pot * 0.5, stack_cap))
+                # Don't commit more than half our stack on a single raise
+                if size > a["max"] * 0.5:
+                    return Action("call") if any(x["type"] == "call" for x in legal) else Action(a["type"], a["min"])
+                return Action(a["type"], int(size))
 
         # fallback to call
         for a in legal:

@@ -52,9 +52,14 @@ class MonteCarloBot:
         # -----------------------------
         if to_call > 0:
             pot_odds = to_call / (pot + to_call) if (pot + to_call) > 0 else 0.5
+            my_stack = state.stacks.get(state.me, 0)
 
             # Weak hand → fold
             if winrate < pot_odds:
+                return self._choose("fold", legal)
+
+            # Large call (>40% of stack) requires stronger hand
+            if my_stack > 0 and to_call > my_stack * 0.4 and winrate < 0.70:
                 return self._choose("fold", legal)
 
             # Medium hand → call
@@ -150,8 +155,10 @@ class MonteCarloBot:
     def _raise(self, pot, legal):
         for a in legal:
             if a["type"] == "raise":
-                amt = max(a["min"], min(a["max"], pot * 0.75))
-                return Action("raise", round(amt, 2))
+                # Cap at 30% of stack to avoid all-in escalation
+                stack_cap = a["max"] * 0.30
+                amt = max(a["min"], min(a["max"], pot * 0.75, stack_cap))
+                return Action("raise", int(amt))
         return self._choose("call", legal)
 
     # ----------------------------------------------------
@@ -160,8 +167,9 @@ class MonteCarloBot:
     def _bet(self, pot, legal):
         for a in legal:
             if a["type"] == "bet":
-                amt = max(a["min"], min(a["max"], pot * 0.5))
-                return Action("bet", round(amt, 2))
+                stack_cap = a["max"] * 0.25
+                amt = max(a["min"], min(a["max"], pot * 0.5, stack_cap))
+                return Action("bet", int(amt))
         return self._choose("check", legal)
 
     def _get_position_tightness(self, position):

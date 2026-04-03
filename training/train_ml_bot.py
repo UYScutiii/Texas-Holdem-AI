@@ -9,7 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from bots.models.poker_mlp import PokerMLP
+from models.poker_mlp import PokerMLP
 
 import torch.nn as nn
 
@@ -426,7 +426,7 @@ if __name__ == "__main__":
     )
 
     # ---- SAVE MODEL ----
-    save_path = "bots/models/ml_model.pt"
+    save_path = "models/ml_model.pt"
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save(model.state_dict(), save_path)
 

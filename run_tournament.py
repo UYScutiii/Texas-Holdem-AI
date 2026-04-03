@@ -9,7 +9,11 @@ import sys
 import time
 import threading
 import matplotlib
-matplotlib.use("macosx")  # Use native macOS backend (no tkinter needed)
+if sys.platform == "darwin":
+    matplotlib.use("macosx")
+else:
+    import tkinter  # noqa: F401 – needed by TkAgg backend on Windows
+    matplotlib.use("TkAgg")
 import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 from matplotlib.widgets import Button

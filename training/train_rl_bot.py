@@ -4,7 +4,13 @@ Train the RL bot through self-play or against other bots.
 Supports a curriculum mode that starts against weak opponents and
 advances to stronger ones once the rolling win-rate exceeds a threshold.
 """
+import os
+import sys
 from collections import deque
+
+# Add project root to path so imports work
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, project_root)
 
 from core.engine import Table, Seat, InProcessBot, RandomBot
 from core.bot_api import BotAdapter, PlayerView, Action
@@ -199,7 +205,7 @@ def train_rl_bot(num_episodes=1000, chips_per_player=500,
     print(f"Final Win Rate: {(wins/num_episodes)*100:.1f}%")
     if use_curriculum:
         print(f"Final stage: {CURRICULUM[stage_idx]['name']}")
-    print(f"Model saved to: bots/models/rl_model.pt")
+    print(f"Model saved to: models/rl_model.pt")
     print("=" * 70)
 
 if __name__ == "__main__":

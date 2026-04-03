@@ -2,7 +2,7 @@ import torch
 import random
 from core.bot_api import Action
 from core.engine import eval_hand
-from bots.models.poker_mlp import PokerMLP
+from models.poker_mlp import PokerMLP
 
 
 
@@ -33,7 +33,7 @@ def _as_view(state):
 # ML BOT -------------------------------------------------------------
 
 class MLBot:
-    def __init__(self, model_path="bots/models/ml_model.pt", device="cpu", use_fallback=True):
+    def __init__(self, model_path="models/ml_model.pt", device="cpu", use_fallback=True):
         self.device = device
         self.use_fallback = use_fallback
         self.model = PokerMLP(input_dim=26, hidden=128, num_classes=6)  # Changed from 23 to 26
