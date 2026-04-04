@@ -1,0 +1,67 @@
+Warning: Could not load RL model from models/rl_model.pt: [Errno 2] No such file or directory: 'models/rl_model.pt'
+Using fallback strategy.
+Warning: Could not load model from models/ml_model.pt: [Errno 2] No such file or directory: 'models/ml_model.pt'
+Using untrained model (random weights).
+===========================================================================
+RUNNING 1 TOURNAMENTS
+===========================================================================
+Players: P1=rl, P2=ml, P3=smart, P4=mc200, P5=mc100
+Chips: 500  |  Blinds: 1/2  |  Escalation every 50 hands
+===========================================================================
+
+Warning: Could not load RL model from models/rl_model.pt: [Errno 2] No such file or directory: 'models/rl_model.pt'
+Using fallback strategy.
+Warning: Could not load model from models/ml_model.pt: [Errno 2] No such file or directory: 'models/ml_model.pt'
+Using untrained model (random weights).
+Traceback (most recent call last):
+  File "C:\Users\jaros\OneDrive\Desktop\Projects\PersonalProjects\texas-holdem-ai\run_tournament_stats.py", line 301, in <module>
+    main()
+    ~~~~^^
+  File "C:\Users\jaros\OneDrive\Desktop\Projects\PersonalProjects\texas-holdem-ai\run_tournament_stats.py", line 286, in main
+    run_tournament_batch(
+    ~~~~~~~~~~~~~~~~~~~~^
+        player_spec_str=args.players,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<8 lines>...
+        seed=args.seed,
+        ^^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\jaros\OneDrive\Desktop\Projects\PersonalProjects\texas-holdem-ai\run_tournament_stats.py", line 139, in run_tournament_batch
+    res = run_silent_tournament(task)
+  File "C:\Users\jaros\OneDrive\Desktop\Projects\PersonalProjects\texas-holdem-ai\run_tournament_stats.py", line 51, in run_silent_tournament
+    table.play_hand(
+    ~~~~~~~~~~~~~~~^
+        seats=active_seats,
+        ^^^^^^^^^^^^^^^^^^^
+    ...<4 lines>...
+        on_event=None,
+        ^^^^^^^^^^^^^^
+    )
+    ^
+  File "C:\Users\jaros\OneDrive\Desktop\Projects\PersonalProjects\texas-holdem-ai\core\engine.py", line 331, in play_hand
+    winner = fn(
+        street_name,
+    ...<11 lines>...
+        logger=logger,   # <===== PASS LOGGER HERE
+    )
+  File "C:\Users\jaros\OneDrive\Desktop\Projects\PersonalProjects\texas-holdem-ai\core\engine.py", line 543, in _betting_round
+    raw_action = bot_for[pid].act(view)
+  File "C:\Users\jaros\OneDrive\Desktop\Projects\PersonalProjects\texas-holdem-ai\bots\__init__.py", line 60, in act
+    return self.bot.act(view)
+           ~~~~~~~~~~~~^^^^^^
+  File "C:\Users\jaros\OneDrive\Desktop\Projects\PersonalProjects\texas-holdem-ai\bots\monte_carlo_bot.py", line 40, in act
+    winrate = self._estimate_equity(hole, board, n_opps, sims=self.simulations)
+  File "C:\Users\jaros\OneDrive\Desktop\Projects\PersonalProjects\texas-holdem-ai\bots\monte_carlo_bot.py", line 112, in _estimate_equity
+    opp_scores = [eval_hand(opp, full_board) for opp in opp_hands]
+                  ~~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "C:\Users\jaros\OneDrive\Desktop\Projects\PersonalProjects\texas-holdem-ai\core\engine.py", line 92, in eval_hand
+    return max(_score_five(list(combo)) for combo in combinations(all_cards, 5))
+  File "C:\Users\jaros\OneDrive\Desktop\Projects\PersonalProjects\texas-holdem-ai\core\engine.py", line 92, in <genexpr>
+    return max(_score_five(list(combo)) for combo in combinations(all_cards, 5))
+               ~~~~~~~~~~~^^^^^^^^^^^^^
+  File "C:\Users\jaros\OneDrive\Desktop\Projects\PersonalProjects\texas-holdem-ai\core\engine.py", line 49, in _score_five
+    from collections import Counter as _C
+  File "<frozen importlib._bootstrap>", line 1390, in _handle_fromlist
+KeyboardInterrupt
+^C

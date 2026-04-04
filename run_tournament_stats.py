@@ -161,4 +161,141 @@ def run_tournament_batch(player_spec_str, num_tournaments, chips, base_sb, base_
 
         for pid, pos, hand, elim_chips in fo:
             finish_positions[pid].append(pos)
-            hands_survived[pid].app
+            hands_survived[pid].append(hand)
+            if pos > 1:
+                chips_at_elimination[pid].append(elim_chips)
+
+            # Head-to-head: count wins against each opponent who finished worse
+            for other_pid, other_pos, _, _ in fo:
+                if other_pid != pid and pos < other_pos:
+                    h2h_wins[pid][other_pid] += 1
+
+    # ── Print results ─────────────────────────────────────────────────────────
+
+    print("\n" + "=" * 75)
+    print("LEADERBOARD (sorted by win rate)")
+    print("=" * 75)
+
+    header = (f"{'#':<4} {'Player':<8} {'Bot':<14} {'Wins':>6} {'Win%':>7} "
+              f"{'Avg Pos':>8} {'Avg Elim $':>10} "
+              f"{'Hands (avg)':>12} {'(min)':>7} {'(max)':>7}")
+    print(header)
+    print("-" * 75)
+
+    # Sort by win rate desc
+    sorted_pids = sorted(pids, key=lambda p: wins[p], reverse=True)
+
+    for rank, pid in enumerate(sorted_pids, 1):
+        btype = bot_types[pid]
+        w = wins[pid]
+        wr = (w / num_tournaments) * 100
+        avg_pos = sum(finish_positions[pid]) / len(finish_positions[pid])
+        elim_chips = chips_at_elimination[pid]
+        avg_elim = sum(elim_chips) / len(elim_chips) if elim_chips else 0
+        hs = hands_survived[pid]
+        avg_h = sum(hs) / len(hs) if hs else 0
+        min_h = min(hs) if hs else 0
+        max_h = max(hs) if hs else 0
+
+        print(f"{rank:<4} {pid:<8} {btype:<14} {w:>6} {wr:>6.1f}% "
+              f"{avg_pos:>8.2f} {avg_elim:>10.0f} "
+              f"{avg_h:>12.1f} {min_h:>7} {max_h:>7}")
+
+    # Hand count stats
+    print(f"\n{'Tournaments:':<25} {num_tournaments}")
+    print(f"{'Avg hands/tournament:':<25} {sum(hand_counts)/len(hand_counts):.1f}")
+    print(f"{'Shortest:':<25} {min(hand_counts)}")
+    print(f"{'Longest:':<25} {max(hand_counts)}")
+
+    # Head-to-head matrix
+    print("\n" + "=" * 75)
+    print("HEAD-TO-HEAD WIN RATES")
+    print("=" * 75)
+
+    # Header row
+    col_w = 10
+    print(f"{'':>{col_w}}", end="")
+    for pid in pids:
+        print(f"{pid:>{col_w}}", end="")
+    print()
+
+    for pid_a in pids:
+        print(f"{pid_a:>{col_w}}", end="")
+        for pid_b in pids:
+            if pid_a == pid_b:
+                print(f"{'---':>{col_w}}", end="")
+            else:
+                total = h2h_wins[pid_a][pid_b] + h2h_wins[pid_b][pid_a]
+                if total > 0:
+                    rate = (h2h_wins[pid_a][pid_b] / total) * 100
+                    print(f"{rate:>{col_w - 1}.0f}%", end="")
+                else:
+                    print(f"{'N/A':>{col_w}}", end="")
+        print()
+
+    print("=" * 75)
+
+    # ── CSV output ────────────────────────────────────────────────────────────
+
+    if output_csv:
+        os.makedirs(os.path.dirname(output_csv) or ".", exist_ok=True)
+        with open(output_csv, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["tournament", "winner", "hands",
+                             *[f"{pid}_position" for pid in pids],
+                             *[f"{pid}_hands_survived" for pid in pids]])
+            for i, res in enumerate(results, 1):
+                fo = {pid: (pos, hand) for pid, pos, hand, _ in res["finish_order"]}
+                row = [i, res["winner"], res["hand_count"]]
+                for pid in pids:
+                    pos, hand = fo.get(pid, (0, 0))
+                    row.append(pos)
+                for pid in pids:
+                    pos, hand = fo.get(pid, (0, 0))
+                    row.append(hand)
+                writer.writerow(row)
+        print(f"\nResults saved to {output_csv}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Run multiple Texas Hold'em tournaments and track statistics")
+    parser.add_argument("--players", type=str,
+                        default="rl,ml,smart,mc200,mc100",
+                        help="Comma-separated bot types (default: rl,ml,smart,mc200,mc100)")
+    parser.add_argument("--tournaments", type=int, default=30,
+                        help="Number of tournaments (default: 30)")
+    parser.add_argument("--chips", type=int, default=500,
+                        help="Starting chips per player (default: 500)")
+    parser.add_argument("--sb", type=int, default=1,
+                        help="Starting small blind (default: 1)")
+    parser.add_argument("--bb", type=int, default=2,
+                        help="Starting big blind (default: 2)")
+    parser.add_argument("--blind-increase-every", type=int, default=50,
+                        help="Increase blinds 1.5x every N hands, 0 to disable (default: 50)")
+    parser.add_argument("--max-hands", type=int, default=10000,
+                        help="Safety hand limit per tournament (default: 10000)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="RNG seed for reproducibility")
+    parser.add_argument("--parallel", type=int, default=1,
+                        help="Number of parallel workers (default: 1, sequential)")
+    parser.add_argument("--output-csv", type=str, default=None,
+                        help="Save per-tournament results to CSV file")
+    args = parser.parse_args()
+
+    run_tournament_batch(
+        player_spec_str=args.players,
+        num_tournaments=args.tournaments,
+        chips=args.chips,
+        base_sb=args.sb,
+        base_bb=args.bb,
+        blind_increase_every=args.blind_increase_every,
+        max_hands=args.max_hands,
+        parallel=args.parallel,
+        output_csv=args.output_csv,
+        seed=args.seed,
+    )
+
+
+if __name__ == "__main__":
+    main()

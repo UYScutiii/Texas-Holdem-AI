@@ -1,6 +1,6 @@
 import torch
 from core.bot_api import Action
-from core.engine import eval_hand
+from core.engine import eval_hand, EVAL_HAND_MAX
 from models.poker_mlp import PokerMLP
 
 
@@ -33,11 +33,13 @@ def _as_view(state):
 
 class MLBot:
     def __init__(self, model_path="models/ml_model.pt", device="cpu",
-                 use_fallback=True, temperature=0.8, training_mode=False):
+                 use_fallback=True, temperature=0.8, training_mode=False,
+                 starting_chips=500):
         self.device = device
         self.use_fallback = use_fallback
         self.temperature = temperature
         self.training_mode = training_mode
+        self.starting_chips = max(1, starting_chips)  # normalise stack/pot features
         self.model = PokerMLP(input_dim=26, hidden=128, num_classes=6)
         self.model_trained = False
 
@@ -85,9 +87,11 @@ class MLBot:
         state = _as_view(state)
 
         street = STREET_MAP.get(state.street, 0)
-        pot = float(state.pot)
-        to_call = float(state.to_call)
-        hero_stack = float(state.stacks.get(state.me, 0))
+        # Normalise monetary values so features share the same [0, ~2] scale.
+        scale = self.starting_chips
+        pot = float(state.pot) / scale
+        to_call = float(state.to_call) / scale
+        hero_stack = float(state.stacks.get(state.me, 0)) / scale
         eff_stack = min(hero_stack, min(state.stacks.get(pid, hero_stack) for pid in state.opponents))
         n_players = len(state.opponents) + 1
 
@@ -142,11 +146,11 @@ class MLBot:
         return x.to(self.device)
 
     def _estimate_hand_strength(self, hole, board):
-        """Hand strength estimate using the treys evaluator (0.0-1.0)."""
+        """Hand strength estimate using eval_hand, normalised to [0.0, 1.0]."""
         if not hole or len(hole) < 2:
             return 0.0
         score = eval_hand(hole, board)
-        return min(1.0, score / 7462.0)
+        return score / EVAL_HAND_MAX
 
     # ----------------------------------------------------------
     # ACT ------------------------------------------------------
@@ -311,6 +315,8 @@ class MLBot:
         """
         Update running opponent stats from current hand's history.
         Tracks cumulative stats across all hands with deduplication.
+        Engine history entries use top-level keys:
+          {"pid": player_id, "type": action_type, "street": ..., ...}
         """
         if not history or not opponents:
             return
@@ -319,11 +325,9 @@ class MLBot:
             if not isinstance(entry, dict):
                 continue
             player = entry.get("pid")
-            action = entry.get("action", {})
-            if player not in opponents or not isinstance(action, dict):
+            action_type = entry.get("type", "fold")
+            if player not in opponents:
                 continue
-
-            action_type = action.get("type", "fold")
 
             if player not in self.opponent_stats:
                 self.opponent_stats[player] = {

@@ -26,32 +26,7 @@ def encode_card(card):
     return [RANKS[rank], SUITS[suit]]
 
 
-def bucket_raise(chosen, legal):
-    t = chosen["type"]
 
-    if t == "fold":
-        return 0
-    if t == "check":
-        return 1
-    if t == "call":
-        return 2
-
-    if t in ("bet", "raise"):
-        amt = chosen.get("amount")
-        mn = legal.get("min", None)
-        mx = legal.get("max", None)
-
-        # if ANYTHING is missing or weird -> put everything into one bucket (label 3)
-        if amt is None or mn is None or mx is None or mn >= mx:
-            return 3
-
-        # scale raise sizes across 5 buckets (labels 3-8)
-        bucket = int((amt - mn) / max(1, (mx - mn)) * 5)
-        bucket = max(0, min(bucket, 4))  # clamp 0-4
-        return 3 + bucket
-
-    # fallback bucket instead of returning None
-    return 0
 
 def load_decision_logs(root):
     """
@@ -96,15 +71,17 @@ class PokerDataset(Dataset):
         "raise_large": 5
     }
 
-    def __init__(self, log_folder, filter_players=None, filter_winners_only=False):
+    def __init__(self, log_folder, filter_players=None, filter_winners_only=False,
+                 starting_chips=500):
         """
         Args:
             log_folder: Directory containing log files
             filter_players: List of player IDs to include (e.g., ["P3"] for MonteCarloBot only)
             filter_winners_only: If True, only include decisions from hands that were won
+            starting_chips: Used to normalise pot and stack features to [0, ~2] scale
         """
         self.samples = []
-
+        self.starting_chips = max(1, starting_chips)
         # Load all decisions first to build memory context
         all_decisions = []  # Will store all decisions in order
         for path in glob.glob(f"{log_folder}/**/*.jsonl", recursive=True):
@@ -199,20 +176,22 @@ class PokerDataset(Dataset):
                 board_enc.append(0)
 
             street = STREET_MAP[row["street"]]
-            pot = float(row["pot"])
-            to_call = float(row["to_call"])
+            # Normalise monetary features to [0, ~2] scale (same as MLBot inference)
+            scale = self.starting_chips
+            pot = float(row["pot"]) / scale
+            to_call = float(row["to_call"]) / scale
 
             stacks = row["stacks"]
             me = row["player"]
-            hero_stack = float(stacks[me])
-            eff_stack = min(float(v) for v in stacks.values())
+            hero_stack = float(stacks[me]) / scale
+            eff_stack = min(float(v) for v in stacks.values()) / scale
             n_players = len([v for v in stacks.values() if v > 0])
 
-            # Hand strength
+            # Hand strength — normalised the same way as MLBot._estimate_hand_strength()
             if hole and len(hole) >= 2:
-                from core.engine import eval_hand
+                from core.engine import eval_hand, EVAL_HAND_MAX
                 score = eval_hand(hole, board)
-                hand_strength = min(1.0, score / 7462.0)
+                hand_strength = score / EVAL_HAND_MAX
             else:
                 hand_strength = 0.0
 
@@ -222,10 +201,10 @@ class PokerDataset(Dataset):
             else:
                 pot_odds = 0.0
 
-            # Position encoding
+            # Position encoding — matches ml_bot.py position_order
             position_order = {
                 "UTG": 0.0, "UTG+1": 0.1, "MP": 0.3, "LJ": 0.4,
-                "HJ": 0.6, "CO": 0.8, "BTN": 1.0, "SB": 0.7, "BB": 0.5
+                "HJ": 0.6, "CO": 0.8, "BTN": 1.0, "SB": 0.5, "BB": 0.5
             }
             position = row.get("position", "MP")
             position_value = position_order.get(position, 0.5)

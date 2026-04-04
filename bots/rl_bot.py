@@ -9,7 +9,7 @@ import random
 import numpy as np
 from collections import deque
 from core.bot_api import Action, PlayerView
-from core.engine import eval_hand
+from core.engine import eval_hand, EVAL_HAND_MAX
 
 # Card encoding (same as MLBot)
 RANKS = {"2":2, "3":3, "4":4, "5":5, "6":6, "7":7, "8":8,
@@ -49,11 +49,13 @@ class RLBot:
     """
     
     def __init__(self, model_path="models/rl_model.pt", device="cpu",
-                 learning_rate=1e-4, training_mode=False, exploration_rate=0.1, use_fallback=True):
+                 learning_rate=1e-4, training_mode=False, exploration_rate=0.1,
+                 use_fallback=True, starting_chips=500):
         self.device = device
         self.training_mode = training_mode
         self.exploration_rate = exploration_rate
         self.use_fallback = use_fallback
+        self.starting_chips = max(1, starting_chips)  # used to normalise stack/pot features
         self.model_loaded = False  # Track if model loaded successfully
         self.policy_net = PolicyNetwork(input_dim=26, hidden=512).to(device)  # Increased to 512
         self.optimizer = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
@@ -96,9 +98,12 @@ class RLBot:
             state = DictView(state)
         
         street = STREET_MAP.get(state.street, 0)
-        pot = float(state.pot)
-        to_call = float(state.to_call)
-        hero_stack = float(state.stacks.get(state.me, 0))
+        # Normalise monetary values by starting stack so they are on [0, ~2]
+        # rather than raw chip counts (0 – 1000+).
+        scale = self.starting_chips
+        pot = float(state.pot) / scale
+        to_call = float(state.to_call) / scale
+        hero_stack = float(state.stacks.get(state.me, 0)) / scale
         eff_stack = min(hero_stack, min(state.stacks.get(pid, hero_stack) for pid in state.opponents))
         n_players = len(state.opponents) + 1
         
@@ -129,10 +134,10 @@ class RLBot:
         else:
             pot_odds = 0.0
         
-        # Position
+        # Position encoding
         position_order = {
             "UTG": 0.0, "UTG+1": 0.1, "MP": 0.3, "LJ": 0.4,
-            "HJ": 0.6, "CO": 0.8, "BTN": 1.0, "SB": 0.7, "BB": 0.5
+            "HJ": 0.6, "CO": 0.8, "BTN": 1.0, "SB": 0.5, "BB": 0.5
         }
         position_value = position_order.get(state.position, 0.5)
         
@@ -149,77 +154,66 @@ class RLBot:
         return torch.tensor(features, dtype=torch.float32).unsqueeze(0).to(self.device)
     
     def _estimate_hand_strength(self, hole, board):
-        """Hand strength estimate using the treys evaluator (0.0–1.0)."""
+        """Hand strength estimate using eval_hand, normalised to [0.0, 1.0]."""
         if not hole or len(hole) < 2:
             return 0.0
         score = eval_hand(hole, board)
-        return min(1.0, score / 7462.0)
+        return score / EVAL_HAND_MAX
     
     def _calculate_memory_features(self, history, me, opponents):
-        """Calculate opponent behavior features."""
+        """Calculate opponent behavior features from action history."""
         if not opponents or not history:
             return [0.5, 0.5, 0.5]
-        
-        opponent_actions = []
-        for entry in history:
-            if isinstance(entry, dict):
-                player = entry.get("pid")
-                action = entry.get("action", {})
-                if player in opponents and isinstance(action, dict):
-                    opponent_actions.append({
-                        "player": player,
-                        "type": action.get("type", "fold")
-                    })
-        
-        if hasattr(self, 'opponent_stats') and self.opponent_stats:
-            for opp_id in opponents:
-                if opp_id in self.opponent_stats:
-                    stats = self.opponent_stats[opp_id]
-                    for _ in range(int(stats.get('action_count', 0))):
-                        if stats.get('last_action'):
-                            opponent_actions.append({
-                                "player": opp_id,
-                                "type": stats['last_action']
-                            })
-        
+
+        # History entries written by the engine use top-level keys:
+        # {"street": ..., "pid": ..., "type": "fold"|"call"|..., "amount": ...}
+        opponent_actions = [
+            entry
+            for entry in history
+            if isinstance(entry, dict) and entry.get("pid") in opponents
+        ]
+
         if not opponent_actions:
             return [0.5, 0.5, 0.5]
-        
+
         recent = opponent_actions[-10:]
         total = len(recent)
         if total == 0:
             return [0.5, 0.5, 0.5]
-        
+
         aggressive = sum(1 for d in recent if d.get("type") in ("bet", "raise")) / total
         tightness = sum(1 for d in recent if d.get("type") == "fold") / total
         vpip = sum(1 for d in recent if d.get("type") in ("call", "bet", "raise", "check")) / total
-        
+
         return [aggressive, tightness, vpip]
     
     def _update_memory(self, history, opponents):
-        """Update opponent stats."""
+        """Update opponent stats from hand history."""
         if not history or not opponents:
             return
+        # Engine history entries: {"pid": ..., "type": "fold"|"call"|..., ...}
         for entry in history:
-            if isinstance(entry, dict):
-                player = entry.get("pid")
-                action = entry.get("action", {})
-                if player in opponents and isinstance(action, dict):
-                    action_type = action.get("type", "fold")
-                    if player not in self.opponent_stats:
-                        self.opponent_stats[player] = {
-                            'action_count': 0, 'aggressive_count': 0,
-                            'fold_count': 0, 'vpip_count': 0, 'last_action': action_type
-                        }
-                    stats = self.opponent_stats[player]
-                    stats['action_count'] += 1
-                    stats['last_action'] = action_type
-                    if action_type in ("bet", "raise"):
-                        stats['aggressive_count'] += 1
-                    if action_type == "fold":
-                        stats['fold_count'] += 1
-                    if action_type in ("call", "bet", "raise", "check"):
-                        stats['vpip_count'] += 1
+            if not isinstance(entry, dict):
+                continue
+            player = entry.get("pid")
+            action_type = entry.get("type", "fold")
+            if player not in opponents:
+                continue
+
+            if player not in self.opponent_stats:
+                self.opponent_stats[player] = {
+                    'action_count': 0, 'aggressive_count': 0,
+                    'fold_count': 0, 'vpip_count': 0, 'last_action': action_type
+                }
+            stats = self.opponent_stats[player]
+            stats['action_count'] += 1
+            stats['last_action'] = action_type
+            if action_type in ("bet", "raise"):
+                stats['aggressive_count'] += 1
+            if action_type == "fold":
+                stats['fold_count'] += 1
+            if action_type in ("call", "bet", "raise", "check"):
+                stats['vpip_count'] += 1
     
     def _fallback_strategy(self, state):
         """Fallback to simple hand strength logic when model is not loaded."""

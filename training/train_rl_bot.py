@@ -78,6 +78,7 @@ def evaluate_against_mc(rl_bot, num_hands=100, chips=500):
                 dealer_index=dealer_index % len(active),
                 bot_for={s.player_id: bots[s.player_id] for s in active},
                 on_event=None,
+                log_decisions=False,
             )
             dealer_index += 1
             hand_count += 1
@@ -216,17 +217,17 @@ def train_rl_bot(num_episodes=1000, chips_per_player=500,
                 dealer_index=dealer_index % len(active_seats),
                 bot_for={s.player_id: bots[s.player_id] for s in active_seats},
                 on_event=None,
+                log_decisions=False,  # never write logs during RL training
             )
 
-            # Per-step reward: chip change from this hand
+            # Per-hand reward: normalised chip change for this hand only
             chips_after = sum(s.chips for s in seats if s.player_id == "P2")
             hand_reward = (chips_after - chips_before) / chips_per_player
             step_rewards.append(hand_reward)
 
-            # Record per-step reward to rl_bot
+            # Record this hand's reward to RL bot for credit assignment
             if "P2" in result:
-                reward = result["P2"] / chips_per_player
-                rl_bot.record_reward(reward)
+                rl_bot.record_reward(result["P2"] / chips_per_player)
 
             dealer_index = (dealer_index + 1) % len(seats)
             hand_count += 1
@@ -244,7 +245,10 @@ def train_rl_bot(num_episodes=1000, chips_per_player=500,
             wins += 1
 
         final_reward = chip_change / chips_per_player
-        rl_bot.record_reward(final_reward)
+        # Note: per-hand rewards were already recorded inside the loop above.
+        # Do NOT call record_reward again here — that would overwrite every
+        # step's reward with the final terminal value, defeating per-step
+        # credit assignment.
 
         total_chips += final_chips_p2
         recent_rewards.append(final_reward)

@@ -21,6 +21,11 @@ SUITS = "cdhs"
 RANK_TO_INT = {r: i for i, r in enumerate(RANKS)}
 Card = Tuple[str, str]
 
+# Maximum possible score from eval_hand / _score_five.
+# Royal flush (AKQJT suited) = (8 << 24) | 12 = 134_217_740.
+# Use this to normalise hand strength to [0, 1].
+EVAL_HAND_MAX: int = (8 << 24) | 12  # 134_217_740
+
 def full_deck() -> List[Card]:
     return [(r, s) for r in RANKS for s in SUITS]
 
@@ -260,9 +265,10 @@ class Table:
         self.hand_counter = 0
 
     def play_hand(self, seats: List[Seat | Dict[str, Any]], small_blind: int, big_blind: int,
-                  dealer_index: int, bot_for: Dict[str, BotAdapter], on_event=None) -> Dict[str, int]:
-        
-        logger = DecisionLogger(enabled=True)
+                  dealer_index: int, bot_for: Dict[str, BotAdapter], on_event=None,
+                  log_decisions: bool = False) -> Dict[str, int]:
+
+        logger = DecisionLogger(enabled=log_decisions)
 
         # NEW — set hand ID
         logger.start_hand(self.hand_counter)
@@ -312,11 +318,15 @@ class Table:
         board: List[Card] = []
         history: List[Any] = []
 
+        # Preflop action starts at UTG (index 3 for 3+ players; index 0 for heads-up)
+        # ring[0]=BTN, ring[1]=SB, ring[2]=BB, ring[3]=UTG (first to act preflop)
+        preflop_start = 3 if len(ring) > 2 else 0
+
         streets = [
-            ("preflop", self._betting_round),
-            ("flop", self._deal_flop_then_bet),
-            ("turn", self._deal_turn_then_bet),
-            ("river", self._deal_river_then_bet),
+            ("preflop", self._betting_round, {"start_idx": preflop_start}),
+            ("flop",    self._deal_flop_then_bet,  {}),
+            ("turn",    self._deal_turn_then_bet,   {}),
+            ("river",   self._deal_river_then_bet,  {}),
         ]
 
         # Total pot accumulated from completed streets
@@ -326,7 +336,7 @@ class Table:
         total_contrib = defaultdict(int)
 
         # --- main street loop ---
-        for street_name, fn in streets:
+        for street_name, fn, extra_kwargs in streets:
 
             winner = fn(
                 street_name,
@@ -341,7 +351,8 @@ class Table:
                 bot_for,
                 history,
                 on_event,
-                logger=logger,   # <===== PASS LOGGER HERE
+                logger=logger,
+                **extra_kwargs,
             )
 
             # If someone wins by everyone else folding
@@ -385,6 +396,7 @@ class Table:
             logger.log_result(pid, delta)
 
         logger.flush()
+        logger.close()
 
         return net
 
@@ -408,7 +420,7 @@ class Table:
 
     def _betting_round(
         self, street, seats, ring, pos_by_pid, hole, board, contrib, pot, bb,
-        bot_for, history, on_event, logger
+        bot_for, history, on_event, logger, start_idx: int = 0
     ):
         # print(f"\n=== BETTING ROUND START: {street} ===")
         # print(f"Pot before street: {pot}")
@@ -458,7 +470,7 @@ class Table:
                 return True
             return len(contribs) == 1
 
-        idx = 0
+        idx = start_idx % len(ring)
         safety = 0
 
         # -------- MAIN LOOP ----------

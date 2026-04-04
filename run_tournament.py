@@ -250,4 +250,97 @@ class TournamentUI:
             dealer = (dealer + 1) % max(len(active_seats), 1)
             time.sleep(self.hand_delay)
 
-   
+        if active_seats:
+            finishing.append((active_seats[0].player_id, 1))
+            winner = active_seats[0].player_id
+        else:
+            winner = "?"
+
+        self._signal_finish(winner, hand_num)
+
+    # ── Data flag ─────────────────────────────────────────────────────────────
+
+    def _mark_dirty(self):
+        self._dirty = True
+
+    def _signal_finish(self, winner: str, hands_played: int):
+        self._winner_info = (winner, hands_played)
+        self._dirty = True
+
+    # ── Main-thread timer callback ────────────────────────────────────────────
+
+    def _poll_redraw(self):
+        if not self._dirty:
+            return
+        self._dirty = False
+
+        hands = [e["hand"] for e in self.chip_history]
+        for pid, line in self.lines.items():
+            y = [e.get(pid, 0) for e in self.chip_history]
+            line.set_data(hands, y)
+        self.ax.set_xlim(0, max(hands) + 1 if hands else 10)
+
+        # Update blinds display
+        sb, bb = self._current_blinds
+        self.blinds_text.set_text(f"Blinds: {sb}/{bb}")
+
+        if self._winner_info is not None:
+            winner, hands_played = self._winner_info
+            self._timer.stop()
+            self.running = False
+            self.finished = True
+            colour = self.colours.get(winner, "white")
+            self.status_text.set_text(
+                f"{winner} wins!   ({hands_played} hands played)")
+            self.status_text.set_color(colour)
+            self.play_btn.label.set_text("Done")
+            print(f"\nWinner: {winner}  ({hands_played} hands)")
+
+        self.fig.canvas.draw_idle()
+
+    # ── Entry point ───────────────────────────────────────────────────────────
+
+    def show(self):
+        plt.show()
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Interactive Texas Hold'em tournament viewer")
+    parser.add_argument("--players", type=str, default=DEFAULT_PLAYERS,
+                        help=f"Comma-separated bot types (default: {DEFAULT_PLAYERS})")
+    parser.add_argument("--chips", type=int, default=DEFAULT_CHIPS,
+                        help=f"Starting chips (default: {DEFAULT_CHIPS})")
+    parser.add_argument("--sb", type=int, default=DEFAULT_SB,
+                        help=f"Starting small blind (default: {DEFAULT_SB})")
+    parser.add_argument("--bb", type=int, default=DEFAULT_BB,
+                        help=f"Starting big blind (default: {DEFAULT_BB})")
+    parser.add_argument("--delay", type=float, default=DEFAULT_DELAY,
+                        help=f"Initial delay between hands in seconds (default: {DEFAULT_DELAY})")
+    parser.add_argument("--blind-increase-every", type=int,
+                        default=DEFAULT_BLIND_INCREASE_EVERY,
+                        help="Increase blinds 1.5x every N hands, 0 to disable (default: 50)")
+    args = parser.parse_args()
+
+    players = parse_players(args.players)
+    if len(players) < 2:
+        print("Error: need at least 2 players. Check your --players spec.")
+        return
+
+    print(f"Players: {', '.join(f'{pid}={btype}' for pid, btype, _ in players)}")
+    print(f"Chips: {args.chips}  |  Blinds: {args.sb}/{args.bb}  |  "
+          f"Escalation every {args.blind_increase_every} hands")
+
+    ui = TournamentUI(
+        players=players,
+        starting_chips=args.chips,
+        base_sb=args.sb,
+        base_bb=args.bb,
+        hand_delay=args.delay,
+        blind_increase_every=args.blind_increase_every,
+    )
+    ui.show()
+
+
+if __name__ == "__main__":
+    main()

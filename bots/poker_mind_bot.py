@@ -2,7 +2,7 @@
 
 import random
 from core.bot_api import Action, PlayerView
-from core.engine import eval_hand
+from core.engine import eval_hand, EVAL_HAND_MAX
 
 
 class SmartBot:
@@ -192,11 +192,11 @@ class SmartBot:
     # Hand strength estimator
     # -----------------------------------------------------
     def _approx_strength(self, hole, board):
-        """Calculate hand strength using the treys evaluator (0.0-1.0)."""
+        """Calculate hand strength using eval_hand, normalised to [0.0, 1.0]."""
         if not hole or len(hole) < 2:
             return 0.0
         score = eval_hand(hole, board)
-        return min(1.0, score / 7462.0)
+        return score / EVAL_HAND_MAX
 
 
 # backward compatibility
