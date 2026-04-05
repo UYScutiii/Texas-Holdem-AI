@@ -281,7 +281,14 @@ def main():
                         help="Number of parallel workers (default: 1, sequential)")
     parser.add_argument("--output-csv", type=str, default=None,
                         help="Save per-tournament results to CSV file")
+    parser.add_argument("--rl_model", type=str, default=None,
+                        help="Path to RL model weights (e.g. models/rl_model_run3.pt). "
+                             "Rewrites any 'rl' entry in --players to use this model.")
     args = parser.parse_args()
+
+    if args.rl_model:
+        import re
+        args.players = re.sub(r'(?<![:\w])rl(?![\w:])', f'rl:{args.rl_model}', args.players)
 
     run_tournament_batch(
         player_spec_str=args.players,

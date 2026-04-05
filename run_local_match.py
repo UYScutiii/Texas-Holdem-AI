@@ -154,9 +154,16 @@ def main():
                         help="Safety hand limit (default: 5000)")
     parser.add_argument("--output", type=str, default="output/tournament_progress.png",
                         help="Path for the output chart (default: output/tournament_progress.png)")
+    parser.add_argument("--rl_model", type=str, default=None,
+                        help="Path to RL model weights (e.g. models/rl_model_run3.pt). "
+                             "Rewrites any 'rl' entry in --players to use this model.")
     args = parser.parse_args()
 
     from bots import parse_players, create_bot, escalate_blinds
+
+    if args.rl_model:
+        import re
+        args.players = re.sub(r'(?<![:\w])rl(?![\w:])', f'rl:{args.rl_model}', args.players)
 
     player_specs = parse_players(args.players)
     player_ids = [pid for pid, _, _ in player_specs]

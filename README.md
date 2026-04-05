@@ -27,6 +27,20 @@ python run_local_match.py
 python run_tournament_stats.py --tournaments 100 --chips 500
 ```
 
+**Testing a specific RL model checkpoint**:
+```bash
+# Test a specific RL model in a single tournament
+python run_local_match.py --rl_model models/rl_model_run3.pt
+
+# Test a specific RL model in batch statistics
+python run_tournament_stats.py --tournaments 50 --rl_model models/rl_model_run3.pt
+
+# Test a specific RL model in the interactive UI
+python run_tournament.py --rl_model models/rl_model_run3.pt
+```
+
+The `--rl_model` flag automatically rewrites any `rl` entries in the `--players` spec to use the specified model path.
+
 ## Project Structure
 
 ```
@@ -135,13 +149,18 @@ bot2.load("models/cfr_regret.pkl")  # resume from saved state
 
 Three scripts train the RL bot with different opponent curricula. All share the same PPO update loop, GAE-lambda advantage estimation, logging, and CLI arguments.
 
-| Script | Opponents | When to use |
-|---|---|---|
-| `train_rl_bot.py` | Fixed stages: random → heuristic → Monte Carlo | Starting from scratch; simple, well-tested baseline |
-| `train_rl_bot_mixed.py` | Weighted blend of heuristic and Monte Carlo, shifting toward MC as win rate rises | Continuing from a checkpoint; smoother curriculum with no demotion |
-| `train_rl_bot_selfplay.py` | Fixed stages: random → heuristic → self-play (periodic model snapshots) | Final refinement pass; forces the bot to exploit its own weaknesses |
+### train_rl_bot.py
+Fixed-opponent curriculum. Two modes:
+- **Without `--curriculum`**: trains against a fixed opponent (default: montecarlo). Fast for `heuristic` or `self`, but **very slow against montecarlo** (200 simulations per decision).
+- **With `--curriculum`**: walks through **random → heuristic → montecarlo → self-play**. Note that the montecarlo stage is **extremely slow in practice** due to simulation cost per decision. Recommended only if you have significant compute time.
 
-**Typical progression**: train with `train_rl_bot.py` first, then continue with `train_rl_bot_mixed.py` once the bot can beat Monte Carlo, then run `train_rl_bot_selfplay.py` for a final self-play polish.
+### train_rl_bot_mixed.py
+Mixed opponent curriculum (weighted heuristic/MC pool). Smoother curriculum with no demotion as win rate improves.
+
+### train_rl_bot_selfplay.py
+**Recommended training script.** Three-stage curriculum: **random → heuristic → self-play** (skips Monte Carlo entirely for speed). Loads from `models/rl_model_run2.pt` if available, saves final model to `models/rl_model_run3.pt`.
+
+**Typical progression**: train with `train_rl_bot_selfplay.py` for the fastest results, or start with `train_rl_bot.py` without `--curriculum` for a stable baseline, then continue with `train_rl_bot_mixed.py` once the bot can beat Monte Carlo.
 
 ## Adding a Bot
 

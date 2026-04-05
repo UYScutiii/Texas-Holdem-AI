@@ -21,7 +21,7 @@ def create_bot(btype: str) -> BotAdapter:
       mc, mc<N>          MonteCarloBot (optional sim count: mc200, mc500)
       smart              SmartBot (heuristic)
       ml                 MLBot (supervised learning)
-      rl                 RLBot (reinforcement learning)
+      rl, rl:<path>      RLBot (reinforcement learning, with optional model path)
       random             RandomBot
     """
     btype = btype.strip().lower()
@@ -40,15 +40,19 @@ def create_bot(btype: str) -> BotAdapter:
         from bots.ml_bot import MLBot
         return _wrap(MLBot())
 
-    if btype in ("rl", "rlbot"):
+    if btype in ("rl", "rlbot") or btype.startswith("rl:"):
         from bots.rl_bot import RLBot
-        return _wrap(RLBot())
+        if btype.startswith("rl:"):
+            model_path = btype[3:]  # Extract path after "rl:"
+            return _wrap(RLBot(model_path=model_path))
+        else:
+            return _wrap(RLBot())
 
     if btype in ("random",):
         return InProcessBot(RandomBot())
 
     raise ValueError(f"Unknown bot type: {btype!r}. "
-                     "Expected one of: mc, mc<N>, smart, ml, rl, random")
+                     "Expected one of: mc, mc<N>, smart, ml, rl, rl:<path>, random")
 
 
 class _PlayerViewAdapter(BotAdapter):

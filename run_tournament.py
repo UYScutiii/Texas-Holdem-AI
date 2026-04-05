@@ -320,7 +320,14 @@ def main():
     parser.add_argument("--blind-increase-every", type=int,
                         default=DEFAULT_BLIND_INCREASE_EVERY,
                         help="Increase blinds 1.5x every N hands, 0 to disable (default: 50)")
+    parser.add_argument("--rl_model", type=str, default=None,
+                        help="Path to RL model weights (e.g. models/rl_model_run3.pt). "
+                             "Rewrites any 'rl' entry in --players to use this model.")
     args = parser.parse_args()
+
+    if args.rl_model:
+        import re
+        args.players = re.sub(r'(?<![:\w])rl(?![\w:])', f'rl:{args.rl_model}', args.players)
 
     players = parse_players(args.players)
     if len(players) < 2:
