@@ -1,12 +1,11 @@
 """
-Reinforcement Learning Bot using Policy Gradient (REINFORCE)
+Reinforcement Learning Bot using Proximal Policy Optimization (PPO).
 Learns optimal strategies through trial and error.
 """
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import random
-import numpy as np
 from collections import deque
 from core.bot_api import Action, PlayerView
 from core.engine import eval_hand, EVAL_HAND_MAX
@@ -24,7 +23,7 @@ STREET_MAP = {"preflop":0, "flop":1, "turn":2, "river":3}
 
 class PolicyNetwork(nn.Module):
     """Policy network that outputs action probabilities."""
-    def __init__(self, input_dim=26, hidden=512):  # Increased from 256 to 512
+    def __init__(self, input_dim=26, hidden=256):  # Increased from 256 to 512
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(input_dim, hidden),
@@ -42,9 +41,29 @@ class PolicyNetwork(nn.Module):
         return self.net(x)
 
 
+class ValueNetwork(nn.Module):
+    """Value network that estimates V(s) for PPO baseline."""
+    def __init__(self, input_dim=26, hidden=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden, hidden // 2),
+            nn.ReLU(),
+            nn.Linear(hidden // 2, 1),  # single scalar value output
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
 class RLBot:
     """
-    Reinforcement Learning Bot using REINFORCE algorithm.
+    Reinforcement Learning Bot using PPO (Proximal Policy Optimization).
     Learns by playing games and updating policy based on rewards.
     """
     
@@ -57,17 +76,30 @@ class RLBot:
         self.use_fallback = use_fallback
         self.starting_chips = max(1, starting_chips)  # used to normalise stack/pot features
         self.model_loaded = False  # Track if model loaded successfully
-        self.policy_net = PolicyNetwork(input_dim=26, hidden=512).to(device)  # Increased to 512
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
-        
-        # Episode tracking for REINFORCE
+        self.policy_net = PolicyNetwork(input_dim=26, hidden=512).to(device)
+        self.value_net  = ValueNetwork(input_dim=26,  hidden=512).to(device)
+        self.optimizer       = optim.Adam(self.policy_net.parameters(), lr=learning_rate)
+        self.value_optimizer = optim.Adam(self.value_net.parameters(),  lr=learning_rate)
+
+        # Episode tracking for PPO
         self.current_episode = []
         self.episode_rewards = []
-        
+        self._hand_step_start = 0   # index into current_episode where current hand's steps begin
+
+        # Batch buffer: collect multiple episodes before each update
+        self.episode_buffer = []
+        self.batch_size     = 32
+
         # Load existing model if available
         try:
             checkpoint = torch.load(model_path, map_location=device)
-            self.policy_net.load_state_dict(checkpoint)
+            # New format: {'policy': ..., 'value': ...}
+            if isinstance(checkpoint, dict) and 'policy' in checkpoint:
+                self.policy_net.load_state_dict(checkpoint['policy'])
+                self.value_net.load_state_dict(checkpoint['value'])
+            else:
+                # Old format: bare policy state dict — load policy only
+                self.policy_net.load_state_dict(checkpoint)
             self.model_loaded = True
             if training_mode:
                 print(f"Loaded RL model from {model_path} (training mode)")
@@ -81,11 +113,18 @@ class RLBot:
                 print(f"Warning: Could not load RL model from {model_path}: {e}")
                 if use_fallback:
                     print("Using fallback strategy.")
-        
-        self.policy_net.eval() if not training_mode else self.policy_net.train()
-        
+
+        if not training_mode:
+            self.policy_net.eval()
+            self.value_net.eval()
+        else:
+            self.policy_net.train()
+            self.value_net.train()
+
         # Opponent memory
         self.opponent_stats = {}
+        # Running mean of episode returns (kept for diagnostics)
+        self.baseline_returns = deque(maxlen=1000)
     
     def _make_features(self, state):
         """Extract 26-dimensional feature vector (same as MLBot)."""
@@ -275,42 +314,43 @@ class RLBot:
             # Get features
             features = self._make_features(state)
             
-            # Get action probabilities - CRITICAL: only use no_grad in eval mode
+            # Get action probabilities
             if self.training_mode:
-                # Training mode: NEED gradients for backprop
+                # Training mode: need gradients for the PPO update
                 logits = self.policy_net(features)
-                probs = torch.softmax(logits, dim=1)
+                probs  = torch.softmax(logits, dim=1)
+                value  = self.value_net(features)   # shape: (1,)
             else:
                 # Eval mode: no gradients needed
                 with torch.no_grad():
                     logits = self.policy_net(features)
-                    probs = torch.softmax(logits, dim=1)
-            
+                    probs  = torch.softmax(logits, dim=1)
+
             # Epsilon-greedy exploration during training
             if self.training_mode and random.random() < self.exploration_rate:
-                # Explore: random action - but still need gradients for log_prob
+                # Explore: random action — still track log_prob for PPO ratio
                 random_action = random.randint(0, 5)
                 action_idx = torch.tensor([random_action], device=self.device)
-                # Compute log_prob from distribution (has gradients)
                 dist = torch.distributions.Categorical(probs)
                 log_prob = dist.log_prob(action_idx)
             elif self.training_mode:
-                # Exploit: sample from policy (with gradients)
+                # Exploit: sample from policy
                 dist = torch.distributions.Categorical(probs)
                 action_idx = dist.sample()
                 log_prob = dist.log_prob(action_idx)
             else:
-                # Eval mode: take best action (no gradients)
+                # Eval mode: greedy
                 action_idx = probs.argmax(dim=1)
                 log_prob = torch.log(probs[0, action_idx] + 1e-8)
-            
-            # Store for training
+
+            # Store trajectory step for PPO update
             if self.training_mode:
                 self.current_episode.append({
-                    'state': features,
-                    'action': action_idx.item(),
-                    'log_prob': log_prob,  # Now has gradients!
-                    'legal_actions': legal
+                    'state':    features,
+                    'action':   action_idx.item(),
+                    'log_prob': log_prob.detach(),   # old π(a|s) — frozen
+                    'value':    value.detach(),       # V(s) old estimate — frozen
+                    'legal_actions': legal,
                 })
             
             # Convert to actual action
@@ -373,69 +413,155 @@ class RLBot:
     
     def record_reward(self, reward):
         """
-        Record reward for current episode.
-        Call this after each hand with the chip change.
+        Record reward for the most recent hand's steps only.
+
+        Call this after each hand with the normalised chip delta
+        ``(final_chips - starting_chips) / starting_chips``.
+        Only the steps belonging to the hand just played are tagged;
+        earlier hands keep their own rewards.
         """
         if self.training_mode and self.current_episode:
-            # Store reward for all actions in this episode
-            for step in self.current_episode:
+            # Tag only the steps that belong to the hand that just finished
+            for step in self.current_episode[self._hand_step_start:]:
                 step['reward'] = reward
+            # Advance the marker so the next hand's reward won't overwrite these
+            self._hand_step_start = len(self.current_episode)
             self.episode_rewards.append(reward)
     
     def end_episode(self):
-        """End current episode and update policy if training."""
+        """Buffer the completed episode; run PPO update every batch_size episodes."""
         if not self.training_mode or not self.current_episode:
             self.current_episode = []
+            self._hand_step_start = 0
             return
-        
-        # Calculate returns (REINFORCE)
-        returns = []
-        total_return = 0
-        
-        # Discounted returns (backwards) - use higher discount for tournament play
-        for step in reversed(self.current_episode):
-            total_return = step['reward'] + 0.95 * total_return  # gamma=0.95 (was 0.99)
-            returns.insert(0, total_return)
-        
-        # Normalize returns
-        if returns:
-            returns = torch.tensor(returns, dtype=torch.float32)
-            if returns.std() > 1e-8:
-                returns = (returns - returns.mean()) / (returns.std() + 1e-8)
-            else:
-                # If all rewards are same, just use them as-is
-                returns = returns - returns.mean()
-        
-        # Update policy
-        self.policy_net.train()
-        self.optimizer.zero_grad()
-        
-        policy_loss = 0
-        for step, ret in zip(self.current_episode, returns):
-            state = step['state']
-            action = step['action']
-            log_prob = step['log_prob']
-            
-            # REINFORCE: -log_prob * return (negative because we minimize)
-            policy_loss -= log_prob * ret
-        
-        if len(self.current_episode) > 0:
-            policy_loss = policy_loss / len(self.current_episode)
-            policy_loss.backward()
-            
-            # Gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
-            
-            self.optimizer.step()
-        
-        self.policy_net.eval()
-        
-        # Reset episode
+
+        # Move the finished episode into the buffer and reset
+        self.episode_buffer.append(list(self.current_episode))
         self.current_episode = []
-    
+        self._hand_step_start = 0
+
+        # Only update when we have a full batch
+        if len(self.episode_buffer) >= self.batch_size:
+            self._ppo_update(self.episode_buffer)
+            self.episode_buffer = []
+
+    def flush_buffer(self):
+        """Force a PPO update on any remaining buffered episodes (call at end of training)."""
+        if self.training_mode and self.episode_buffer:
+            self._ppo_update(self.episode_buffer)
+            self.episode_buffer = []
+
     def save_model(self, path="models/rl_model.pt"):
-        """Save the trained model."""
+        """Save policy and value network weights to disk."""
         import os
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(self.policy_net.state_dict(), path)
-        print(f"RL model saved to {path}")
+        dir_ = os.path.dirname(path)
+        if dir_:
+            os.makedirs(dir_, exist_ok=True)
+        torch.save({
+            'policy': self.policy_net.state_dict(),
+            'value':  self.value_net.state_dict(),
+        }, path)
+
+    def _ppo_update(self, episodes):
+        """
+        Run a PPO update over a batch of completed episodes.
+
+        Uses clipped surrogate objective (PPO-clip) with:
+          - GAE-lambda advantage estimation (gamma=0.99, lambda=0.95)
+          - Shared normalisation of advantages across the batch
+          - Entropy bonus to encourage exploration
+          - Gradient clipping for stability
+
+        Args:
+            episodes: list of episode buffers, each a list of step dicts
+                      with keys: state, action, log_prob, value, reward
+        """
+        GAMMA     = 0.99
+        LAMBDA    = 0.95
+        CLIP_EPS  = 0.2
+        VF_COEF   = 0.5
+        ENT_COEF  = 0.01
+        PPO_EPOCHS = 4
+
+        all_states       = []
+        all_actions      = []
+        all_old_log_probs = []
+        all_returns      = []
+        all_advantages   = []
+
+        for ep in episodes:
+            # Only keep steps that received a reward assignment
+            steps = [s for s in ep if 'reward' in s]
+            if not steps:
+                continue
+
+            rewards = [s['reward'] for s in steps]
+            values  = [float(s['value'].item() if hasattr(s['value'], 'item')
+                             else s['value']) for s in steps]
+
+            # GAE advantage + discounted return computation (backward pass)
+            gae        = 0.0
+            next_value = 0.0
+            advantages = [0.0] * len(steps)
+            returns    = [0.0] * len(steps)
+
+            for t in reversed(range(len(steps))):
+                delta          = rewards[t] + GAMMA * next_value - values[t]
+                gae            = delta + GAMMA * LAMBDA * gae
+                advantages[t]  = gae
+                returns[t]     = gae + values[t]
+                next_value     = values[t]
+
+            for step, adv, ret in zip(steps, advantages, returns):
+                all_states.append(step['state'])
+                all_actions.append(step['action'])
+                all_old_log_probs.append(step['log_prob'])
+                all_advantages.append(adv)
+                all_returns.append(ret)
+
+        if not all_states:
+            return
+
+        # Stack into tensors
+        states_t       = torch.cat(all_states, dim=0).to(self.device)
+        actions_t      = torch.tensor(all_actions, dtype=torch.long).to(self.device)
+        old_log_probs_t = torch.stack(all_old_log_probs).to(self.device).squeeze()
+        advantages_t   = torch.tensor(all_advantages, dtype=torch.float32).to(self.device)
+        returns_t      = torch.tensor(all_returns,    dtype=torch.float32).to(self.device)
+
+        # Normalise advantages across the whole batch
+        if advantages_t.numel() > 1 and advantages_t.std() > 1e-8:
+            advantages_t = (advantages_t - advantages_t.mean()) / (advantages_t.std() + 1e-8)
+
+        n = states_t.shape[0]
+
+        for _ in range(PPO_EPOCHS):
+            indices = torch.randperm(n, device=self.device)
+
+            # ── Policy loss ──────────────────────────────────────────
+            logits       = self.policy_net(states_t[indices])
+            dist         = torch.distributions.Categorical(logits=logits)
+            new_log_probs = dist.log_prob(actions_t[indices])
+            entropy      = dist.entropy().mean()
+
+            ratio  = torch.exp(new_log_probs - old_log_probs_t[indices].detach())
+            adv_b  = advantages_t[indices]
+            surr1  = ratio * adv_b
+            surr2  = torch.clamp(ratio, 1.0 - CLIP_EPS, 1.0 + CLIP_EPS) * adv_b
+            policy_loss = -torch.min(surr1, surr2).mean() - ENT_COEF * entropy
+
+            self.optimizer.zero_grad()
+            policy_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 0.5)
+            self.optimizer.step()
+
+            # ── Value loss ───────────────────────────────────────────
+            values_pred = self.value_net(states_t[indices])
+            value_loss  = VF_COEF * torch.nn.functional.mse_loss(
+                values_pred, returns_t[indices].detach()
+            )
+
+            self.value_optimizer.zero_grad()
+            value_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 0.5)
+            self.value_optimizer.step()

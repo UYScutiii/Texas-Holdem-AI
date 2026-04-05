@@ -29,20 +29,16 @@ class PlayerViewAdapter(BotAdapter):
         return self.bot.act(view)
 
 # ── Curriculum stages ───────────────────────────────────────────────
-# Each stage has its own min_episodes (warm-up before promotion is
-# considered) and promote_wr (rolling WR threshold to advance).
 CURRICULUM = [
-    {"name": "random",      "make_bot": lambda: InProcessBot(RandomBot()),     "promote_wr": 0.60, "min_episodes": 2_000},
-    {"name": "heuristic",   "make_bot": lambda: PlayerViewAdapter(SmartBot()),  "promote_wr": 0.55, "min_episodes": 3_000},
-    {"name": "montecarlo",  "make_bot": lambda: PlayerViewAdapter(MonteCarloBot(simulations=200)), "promote_wr": 0.55, "min_episodes": 5_000},
-    {"name": "selfplay",    "make_bot": None},  # filled dynamically; terminal stage
+    {"name": "random",      "make_bot": lambda: InProcessBot(RandomBot())},
+    {"name": "heuristic",   "make_bot": lambda: PlayerViewAdapter(SmartBot())},
+    {"name": "montecarlo",  "make_bot": lambda: PlayerViewAdapter(MonteCarloBot(simulations=200))},
+    {"name": "selfplay",    "make_bot": None},  # filled dynamically
 ]
 
-PROMOTE_WINDOW   = 1000   # rolling window size
-
-DEMOTE_WIN_RATE  = 0.35   # drop below this to trigger demotion
-DEMOTE_WINDOW    = 500    # must be at this WR for a full window
-DEMOTE_COOLDOWN  = 500    # episodes to wait after a demotion before allowing re-promotion
+DEFAULT_PROMOTE_WIN_RATE = 0.55
+PROMOTE_WINDOW   = 500    # rolling window size
+MIN_EPISODES     = 10_000 # stay at least this many episodes before first promotion check
 
 
 def _make_opponent(opponent_type):
@@ -100,7 +96,8 @@ def evaluate_against_mc(rl_bot, num_hands=100, chips=500):
 
 def train_rl_bot(num_episodes=1000, chips_per_player=500,
                  opponent_type="montecarlo", use_curriculum=False,
-                 csv_path=None, lr_step_episodes=30000, snapshot_every=500):
+                 promote_win_rate=DEFAULT_PROMOTE_WIN_RATE,
+                 csv_path=None, lr_step_episodes=15000):
     """
     Train RL bot through multiple tournaments.
 
@@ -110,6 +107,7 @@ def train_rl_bot(num_episodes=1000, chips_per_player=500,
         opponent_type: Fixed opponent when curriculum is off.
         use_curriculum: When True, ignore opponent_type and walk through
                         the curriculum stages instead.
+        promote_win_rate: Rolling win-rate threshold for curriculum promotion.
         csv_path: If set, write per-episode metrics to this CSV file.
         lr_step_episodes: Reduce LR by 0.5 every this many episodes.
     """
@@ -118,15 +116,7 @@ def train_rl_bot(num_episodes=1000, chips_per_player=500,
     print("=" * 70)
     print(f"Episodes: {num_episodes}")
     print(f"Chip stack per player: {chips_per_player}")
-    if use_curriculum:
-        thresholds = ", ".join(
-            f"{s['name']}={s['promote_wr']:.0%}(min={s['min_episodes']})"
-            for s in CURRICULUM if 'promote_wr' in s
-        )
-        print(f"Promotion thresholds: {thresholds}")
-        print(f"Demotion threshold: WR < {DEMOTE_WIN_RATE:.0%} over {DEMOTE_WINDOW} episodes")
-        print(f"Demotion cooldown: {DEMOTE_COOLDOWN} episodes")
-    print(f"Rolling window: {PROMOTE_WINDOW} episodes")
+    print(f"Promotion threshold: {promote_win_rate:.0%}")
     print(f"LR step every: {lr_step_episodes} episodes")
     if use_curriculum:
         stages = " -> ".join(s["name"] for s in CURRICULUM)
@@ -154,9 +144,7 @@ def train_rl_bot(num_episodes=1000, chips_per_player=500,
     stage_wins = deque(maxlen=PROMOTE_WINDOW)  # rolling window of 1/0
     stage_episode_count = 0
 
-    # Demotion bookkeeping
-    demote_losses = deque(maxlen=DEMOTE_WINDOW)  # separate window for demotion check
-    episodes_since_demotion = DEMOTE_COOLDOWN  # start at cooldown so first promotion isn't blocked
+    # Baseline for variance reduction (running mean of episode returns)
     baseline_returns = deque(maxlen=1000)
 
     # Best checkpoint tracking
@@ -171,10 +159,7 @@ def train_rl_bot(num_episodes=1000, chips_per_player=500,
         csv_writer.writerow(["episode", "won", "reward", "rolling_wr", "avg_reward", "lr", "stage"])
 
     # Self-play bot maker (needs reference to rl_bot)
-    CURRICULUM[3]["make_bot"] = lambda: InProcessBot(
-        RLBot(training_mode=False, model_path="models/rl_selfplay_snapshot.pt",
-              use_fallback=True)
-    )
+    CURRICULUM[3]["make_bot"] = lambda: InProcessBot(RLBot(training_mode=False))
 
     if use_curriculum:
         print(f"[curriculum] Starting stage 1/{len(CURRICULUM)}: "
@@ -192,12 +177,6 @@ def train_rl_bot(num_episodes=1000, chips_per_player=500,
             for pg in rl_bot.optimizer.param_groups:
                 pg["lr"] = new_lr
             print(f"  [LR] Reduced to {new_lr:.2e} at episode {episode}")
-
-        # ── Self-play snapshot save (before building opponent) ─────────
-        if use_curriculum and stage_idx == len(CURRICULUM) - 1:
-            if episode % snapshot_every == 0:
-                os.makedirs("models", exist_ok=True)
-                rl_bot.save_model("models/rl_selfplay_snapshot.pt")
 
         # ── Build opponent for this episode ──────────────────────
         seats = [
@@ -241,14 +220,14 @@ def train_rl_bot(num_episodes=1000, chips_per_player=500,
                 log_decisions=False,  # never write logs during RL training
             )
 
-            # Per-hand reward: normalised chip delta relative to stack at hand start
+            # Per-hand reward: normalised chip change for this hand only
             chips_after = sum(s.chips for s in seats if s.player_id == "P2")
-            hand_reward = (chips_after - chips_before) / max(chips_before, 1)
+            hand_reward = (chips_after - chips_before) / chips_per_player
             step_rewards.append(hand_reward)
 
             # Record this hand's reward to RL bot for credit assignment
             if "P2" in result:
-                rl_bot.record_reward((chips_after - chips_before) / max(chips_before, 1))
+                rl_bot.record_reward(result["P2"] / chips_per_player)
 
             dealer_index = (dealer_index + 1) % len(seats)
             hand_count += 1
@@ -265,15 +244,11 @@ def train_rl_bot(num_episodes=1000, chips_per_player=500,
         if won:
             wins += 1
 
-        final_reward = (final_chips_p2 - initial_chips_p2) / max(initial_chips_p2, 1)
-
-        # Hybrid reward: per-hand chip-delta rewards were already recorded
-        # inside the loop for local credit assignment.  Now add a terminal
-        # bonus so the policy also receives a strong global win/loss signal.
-        # record_reward only tags steps from _hand_step_start onward, so
-        # this won't overwrite earlier per-hand rewards.
-        final_bonus = 1.0 if won else -0.5
-        rl_bot.record_reward(final_bonus)
+        final_reward = chip_change / chips_per_player
+        # Note: per-hand rewards were already recorded inside the loop above.
+        # Do NOT call record_reward again here — that would overwrite every
+        # step's reward with the final terminal value, defeating per-step
+        # credit assignment.
 
         total_chips += final_chips_p2
         recent_rewards.append(final_reward)
@@ -288,123 +263,81 @@ def train_rl_bot(num_episodes=1000, chips_per_player=500,
             csv_writer.writerow([episode, int(won), final_reward, rolling_wr_val,
                                  avg_reward, current_lr, stage_name])
 
-        # ── Curriculum promotion / demotion check ────────────────
+        # ── Curriculum promotion check ───────────────────────────
         if use_curriculum:
             stage_wins.append(1 if won else 0)
-            demote_losses.append(1 if won else 0)
             stage_episode_count += 1
-            episodes_since_demotion += 1
 
-            stage_min_eps = CURRICULUM[stage_idx].get('min_episodes', 2000)
-
-            # ── Promotion check ──────────────────────────────────
             if (stage_idx < len(CURRICULUM) - 1
-                    and stage_episode_count >= stage_min_eps
-                    and episodes_since_demotion >= DEMOTE_COOLDOWN
-                    and len(stage_wins) >= PROMOTE_WINDOW):
-                rolling_wr = sum(stage_wins) / len(stage_wins)
-                effective_promote_wr = CURRICULUM[stage_idx].get('promote_wr', 0.60)
-                if rolling_wr >= effective_promote_wr:
+                    and stage_episode_count >= MIN_EPISODES
+                    and len(stage_wins) == PROMOTE_WINDOW):
+                rolling_wr = sum(stage_wins) / PROMOTE_WINDOW
+                if rolling_wr >= promote_win_rate:
                     stage_idx += 1
                     stage_wins.clear()
-                    demote_losses.clear()
                     stage_episode_count = 0
                     print(f"\n{'=' * 70}")
-                    print(f"[curriculum] PROMOTED to stage "
+                    print(f"[curriculum] Promoted to stage "
                           f"{stage_idx + 1}/{len(CURRICULUM)}: "
                           f"{CURRICULUM[stage_idx]['name']}  "
                           f"(episode {episode}, rolling WR "
                           f"{rolling_wr:.1%})")
                     print(f"{'=' * 70}\n")
-                    # Write initial snapshot when entering self-play stage
-                    if stage_idx == len(CURRICULUM) - 1:
-                        os.makedirs("models", exist_ok=True)
-                        rl_bot.save_model("models/rl_selfplay_snapshot.pt")
-                        print(f"  [snapshot] Initial self-play snapshot saved.\n")
-                elif episode % 1000 == 0:
-                    # Periodic diagnostic: why didn't we promote?
-                    rolling_wr = sum(stage_wins) / len(stage_wins) if stage_wins else 0
-                    needed = CURRICULUM[stage_idx].get('promote_wr', 0.60)
-                    eps_so_far = stage_episode_count
-                    print(f"  [curriculum] stage={CURRICULUM[stage_idx]['name']}  "
-                          f"rolling_wr={rolling_wr:.1%}/{needed:.0%}  "
-                          f"stage_eps={eps_so_far}/{stage_min_eps}  "
-                          f"cooldown_left={max(0, DEMOTE_COOLDOWN - episodes_since_demotion)}")
 
-            # ── Demotion check ────────────────────────────────────
-            if use_curriculum and stage_idx > 0:
-                if len(demote_losses) >= DEMOTE_WINDOW:
-                    demotion_wr = sum(demote_losses) / len(demote_losses)
-                    if demotion_wr < DEMOTE_WIN_RATE and episodes_since_demotion >= DEMOTE_COOLDOWN:
-                        stage_idx -= 1
-                        stage_wins.clear()
-                        demote_losses.clear()
-                        stage_episode_count = 0
-                        episodes_since_demotion = 0
-                        print(f"\n{'=' * 70}")
-                        print(f"[curriculum] DEMOTED to stage "
-                              f"{stage_idx + 1}/{len(CURRICULUM)}: "
-                              f"{CURRICULUM[stage_idx]['name']}  "
-                              f"(episode {episode}, rolling WR "
-                              f"{demotion_wr:.1%})")
-                        print(f"{'=' * 70}\n")
+        # Progress update
+        if episode % 50 == 0 or episode == num_episodes:
+            win_rate = (wins / episode) * 100
+            recent_win_rate = (
+                sum(1 for r in recent_rewards if r > 0) / len(recent_rewards) * 100
+                if recent_rewards else win_rate
+            )
+            avg_chips = total_chips / episode
+            stage_info = ""
+            if use_curriculum:
+                wr = (sum(stage_wins) / len(stage_wins) * 100
+                      if stage_wins else 0)
+                stage_info = (f" | Stage: {CURRICULUM[stage_idx]['name']}"
+                              f" (WR {wr:.1f}%)")
+            print(f"Episode {episode}/{num_episodes} | "
+                  f"Win Rate: {win_rate:.1f}% | "
+                  f"Recent (50): {recent_win_rate:.1f}% | "
+                  f"Avg Final Chips: {avg_chips:.1f}{stage_info}")
 
-        # ── Progress print ────────────────────────────────────────
-        if episode % 100 == 0:
-            rolling_wr = wins / episode
-            avg_reward = sum(recent_rewards) / len(recent_rewards) if recent_rewards else 0
-            current_lr = rl_bot.optimizer.param_groups[0]['lr']
-            stage_name = CURRICULUM[stage_idx]['name'] if use_curriculum else opponent_type
-            print(f"  ep={episode:>6}  wins={wins:>5}  "
-                  f"wr={rolling_wr:.1%}  avg_r={avg_reward:+.3f}  "
-                  f"lr={current_lr:.1e}  stage={stage_name}")
+    # Process last episode's policy update
+    rl_bot.end_episode()
 
-    # ── End of training ───────────────────────────────────────────
-    rl_bot.flush_buffer()
-
-    os.makedirs("models", exist_ok=True)
-    final_path = "models/rl_model_run1.pt"
-    rl_bot.save_model(final_path)
-    print(f"\nModel saved to {final_path}")
-
+    # Close CSV
     if csv_file:
         csv_file.close()
-        print(f"Training log saved to {csv_path}")
 
-    final_wr = wins / num_episodes if num_episodes > 0 else 0
-    avg_final = sum(recent_rewards) / len(recent_rewards) if recent_rewards else 0
-    print(f"\n{'=' * 70}")
-    print(f"Training complete.")
-    print(f"  Episodes: {num_episodes}")
-    print(f"  Wins:     {wins} / {num_episodes}  ({final_wr:.1%})")
-    print(f"  Avg reward (last 100): {avg_final:+.3f}")
-    print(f"{'=' * 70}")
+    # Save trained model
+    rl_bot.save_model()
 
-    return rl_bot
+    print("\n" + "=" * 70)
+    print("TRAINING COMPLETE")
+    print("=" * 70)
+    print(f"Final Win Rate: {(wins/num_episodes)*100:.1f}%")
+    if use_curriculum:
+        print(f"Final stage: {CURRICULUM[stage_idx]['name']}")
+    print(f"Model saved to: models/rl_model.pt")
+    print("=" * 70)
 
-
-# ── CLI entry point ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train the RL poker bot")
-    parser.add_argument("--episodes",   type=int,   default=10_000,
-                        help="Number of tournament episodes to train for (default: 10000)")
-    parser.add_argument("--chips",      type=int,   default=500,
-                        help="Starting chips per player (default: 500)")
-    parser.add_argument("--opponent",   type=str,   default="montecarlo",
-                        choices=["montecarlo", "heuristic", "self"],
-                        help="Fixed opponent type when not using curriculum (default: montecarlo)")
+    parser = argparse.ArgumentParser(description="Train RL bot")
+    parser.add_argument("--episodes", type=int, default=50000,
+                        help="Number of training episodes (default: 50000)")
+    parser.add_argument("--chips", type=int, default=500,
+                        help="Starting chips per player")
+    parser.add_argument("--opponent", type=str, default="montecarlo",
+                        choices=["self", "montecarlo", "smart"],
+                        help="Opponent type (ignored when --curriculum is set)")
     parser.add_argument("--curriculum", action="store_true",
-                        help="Use curriculum training (random -> heuristic -> MC -> self-play)")
-    parser.add_argument("--csv",        type=str,   default="output/rl_training_log.csv",
-                        help="Path to write per-episode CSV log (default: output/rl_training_log.csv)")
-    parser.add_argument("--lr_step",    type=int,   default=30_000,
-                        help="Reduce LR by 0.5x every this many episodes (default: 30000)")
-    parser.add_argument("--snapshot_every", type=int, default=500,
-                        help="Save self-play snapshot every N episodes in self-play stage (default: 500)")
-    args = parser.parse_args()
+                        help="Use curriculum training: random -> heuristic -> montecarlo")
+    parser.add_argument("--csv", type=str, default=None,
+                        help="Path to write per-episode CSV metrics")
 
-    os.makedirs("output", exist_ok=True)
+    args = parser.parse_args()
 
     train_rl_bot(
         num_episodes=args.episodes,
@@ -412,6 +345,4 @@ if __name__ == "__main__":
         opponent_type=args.opponent,
         use_curriculum=args.curriculum,
         csv_path=args.csv,
-        lr_step_episodes=args.lr_step,
-        snapshot_every=args.snapshot_every,
     )
