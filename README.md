@@ -1,6 +1,6 @@
 # Texas Hold'em Bot
 
-A poker engine with pluggable AI bots. Comes with four bot types ranging from simple heuristics to neural network-based strategies, a live tournament UI, and training pipelines for the ML and RL bots.
+A poker engine with pluggable AI bots. Comes with five bot types ranging from simple heuristics to neural network-based and game-theoretic strategies, a live tournament UI, and training pipelines for the ML and RL bots.
 
 ## Setup
 
@@ -32,9 +32,13 @@ python run_tournament_stats.py --tournaments 100 --chips 500
 ```
 .
 ├── core/               Game engine, bot interface, decision logger
-├── bots/               Bot implementations (Monte Carlo, Poker Mind, ML, RL)
+├── bots/               Bot implementations (Monte Carlo, Poker Mind, ML, RL, CFR)
+│   └── cfr_bot.py          Monte Carlo CFR bot
 ├── models/             Neural network architecture and saved model weights (.pt)
 ├── training/           Training scripts for ML and RL bots
+│   ├── train_rl_bot.py         Original fixed-opponent curriculum (random → heuristic → MC)
+│   ├── train_rl_bot_mixed.py   Mixed opponent curriculum (weighted heuristic/MC pool)
+│   └── train_rl_bot_selfplay.py Self-play curriculum (random → heuristic → self-play)
 ├── data/               Training datasets
 ├── logs/               Auto-generated decision logs (JSONL)
 ├── output/             Tournament charts and visualizations
@@ -57,7 +61,7 @@ Contains the `PokerMLP` network definition (`poker_mlp.py`) and any saved model 
 
 ### training/
 
-Scripts to train the ML and RL bots. Both add the project root to `sys.path` so they can be run from anywhere.
+Scripts to train the ML and RL bots. All scripts add the project root to `sys.path` so they can be run from anywhere. Three separate scripts cover different RL training strategies — see the **Training Scripts** section below for guidance on which to use.
 
 ### logs/
 
@@ -90,21 +94,54 @@ python training/train_ml_bot.py --log_dir logs --filter_winners
 
 ### RL Bot
 
-Reinforcement learning bot using the REINFORCE policy gradient algorithm. Learns through trial and error by playing thousands of games. Uses a deeper network (512 hidden units, dropout) with the same 26-feature input as the ML bot. Supports curriculum training that starts against weak opponents (random) and promotes to stronger ones (heuristic, then Monte Carlo) once win rate crosses a threshold.
+Reinforcement learning bot using Proximal Policy Optimization (PPO) with Generalized Advantage Estimation (GAE-lambda). Learns through trial and error by playing thousands of games. Uses a deeper network (512 hidden units, dropout) with the same 26-feature input as the ML bot, plus a separate value network for the critic. Rewards are normalized chip deltas for proportional credit assignment. Supports three different training modes via three separate scripts — see **Training Scripts** below.
 
 Train it:
 ```bash
-# Against Monte Carlo (recommended)
-python training/train_rl_bot.py --episodes 50000 --opponent montecarlo
-
-# Curriculum mode: random -> heuristic -> Monte Carlo
+# Original fixed-opponent curriculum (random -> heuristic -> Monte Carlo)
 python training/train_rl_bot.py --episodes 50000 --curriculum
 
-# Self-play
-python training/train_rl_bot.py --episodes 50000 --opponent self
+# Mixed opponent curriculum (weighted heuristic/MC pool, no demotion)
+python training/train_rl_bot_mixed.py --episodes 50000
+
+# Self-play curriculum (random -> heuristic -> self-play snapshots)
+python training/train_rl_bot_selfplay.py --episodes 50000
 ```
 
-Both training scripts save models to `models/`.
+All three scripts save models to `models/`.
+
+### CFR Bot
+
+Game-theoretic bot using Monte Carlo Counterfactual Regret Minimization (MCCFR). Rather than learning from trial and error, it iteratively reduces regret across sampled game trajectories until its strategy converges toward a Nash equilibrium. Unlike the RL bot, it does not use a neural network — instead it maintains a persistent regret table that updates across hands within a session.
+
+Key design details:
+- **Bet abstraction**: actions are bucketed into 33% pot, 67% pot, pot, and all-in bets, keeping the information state space tractable.
+- **Card abstraction**: hole cards and board texture are mapped to hand-strength buckets rather than exact ranks/suits.
+- **Regret table**: stored in memory and optionally persisted to disk between sessions so the strategy improves over multiple runs.
+- Converges toward Nash equilibrium over time — the more iterations, the closer to optimal play.
+
+Save and load the regret table:
+```python
+from bots.cfr_bot import CFRBot
+
+bot = CFRBot(iterations=1000)
+bot.save("models/cfr_regret.pkl")   # persist regret table
+
+bot2 = CFRBot()
+bot2.load("models/cfr_regret.pkl")  # resume from saved state
+```
+
+## Training Scripts
+
+Three scripts train the RL bot with different opponent curricula. All share the same PPO update loop, GAE-lambda advantage estimation, logging, and CLI arguments.
+
+| Script | Opponents | When to use |
+|---|---|---|
+| `train_rl_bot.py` | Fixed stages: random → heuristic → Monte Carlo | Starting from scratch; simple, well-tested baseline |
+| `train_rl_bot_mixed.py` | Weighted blend of heuristic and Monte Carlo, shifting toward MC as win rate rises | Continuing from a checkpoint; smoother curriculum with no demotion |
+| `train_rl_bot_selfplay.py` | Fixed stages: random → heuristic → self-play (periodic model snapshots) | Final refinement pass; forces the bot to exploit its own weaknesses |
+
+**Typical progression**: train with `train_rl_bot.py` first, then continue with `train_rl_bot_mixed.py` once the bot can beat Monte Carlo, then run `train_rl_bot_selfplay.py` for a final self-play polish.
 
 ## Adding a Bot
 
