@@ -52,7 +52,8 @@ The `--rl_model` flag automatically rewrites any `rl` entries in the `--players`
 ├── training/           Training scripts for ML and RL bots
 │   ├── train_rl_bot.py         Original fixed-opponent curriculum (random → heuristic → MC)
 │   ├── train_rl_bot_mixed.py   Mixed opponent curriculum (weighted heuristic/MC pool)
-│   └── train_rl_bot_selfplay.py Self-play curriculum (random → heuristic → self-play)
+│   ├── train_rl_bot_selfplay.py Self-play curriculum (random → heuristic → self-play)
+│   └── train_cfr_bot.py        Pure self-play CFR training (MCCFR, Nash convergence)
 ├── data/               Training datasets
 ├── logs/               Auto-generated decision logs (JSONL)
 ├── output/             Tournament charts and visualizations
@@ -75,7 +76,7 @@ Contains the `PokerMLP` network definition (`poker_mlp.py`) and any saved model 
 
 ### training/
 
-Scripts to train the ML and RL bots. All scripts add the project root to `sys.path` so they can be run from anywhere. Three separate scripts cover different RL training strategies — see the **Training Scripts** section below for guidance on which to use.
+Scripts to train the ML, RL, and CFR bots. All scripts add the project root to `sys.path` so they can be run from anywhere. Three separate scripts cover different RL training strategies and one dedicated script trains the CFR bot — see the **Training Scripts** section below for guidance on which to use.
 
 ### logs/
 
@@ -161,6 +162,20 @@ Mixed opponent curriculum (weighted heuristic/MC pool). Smoother curriculum with
 **Recommended training script.** Three-stage curriculum: **random → heuristic → self-play** (skips Monte Carlo entirely for speed). Loads from `models/rl_model_run2.pt` if available, saves final model to `models/rl_model_run3.pt`.
 
 **Typical progression**: train with `train_rl_bot_selfplay.py` for the fastest results, or start with `train_rl_bot.py` without `--curriculum` for a stable baseline, then continue with `train_rl_bot_mixed.py` once the bot can beat Monte Carlo.
+
+### train_cfr_bot.py
+Dedicated self-play training script for the CFR bot. A single CFRBot instance plays both seats simultaneously, building a shared regret table from both perspectives on every hand — the theoretically correct approach for Nash convergence. Saves the regret table to `models/cfr_regret.pkl` periodically and resumes automatically from that file if it exists on startup.
+
+```bash
+# Default: 50,000 episodes at 200 MCCFR rollouts per decision
+python training/train_cfr_bot.py
+
+# Higher quality (slower)
+python training/train_cfr_bot.py --tournaments 100000 --iterations 500
+
+# Resume from a previous run or save to a custom path
+python training/train_cfr_bot.py --profile models/cfr_v2.pkl
+```
 
 ## Adding a Bot
 
