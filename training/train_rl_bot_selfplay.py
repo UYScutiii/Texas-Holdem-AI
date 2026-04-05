@@ -143,15 +143,12 @@ def train_rl_bot(num_episodes=10_000, chips_per_player=500,
     initial_lr      = 3e-4
     lr_decay_factor = 0.5
 
-    # ── Patch self-play entry ─────────────────────────────────────────────
-    # RLBot now builds 512-unit networks natively, so no swap needed here.
-    CURRICULUM[-1]["make_bot"] = lambda: InProcessBot(
-        RLBot(
-            model_path=SNAPSHOT_PATH,
-            training_mode=False,
-            use_fallback=True,
-        )
-    )
+    # ── Pre-build self-play opponent placeholder ──────────────────────────
+    # The actual opponent is constructed once per episode (or once per
+    # snapshot interval) inside the training loop — NOT via a lambda that
+    # fires on every hand.  We keep a reference here and rebuild it only
+    # when a fresh snapshot has been saved.
+    selfplay_opponent: InProcessBot | None = None
 
     table = Table()
 
@@ -192,18 +189,36 @@ def train_rl_bot(num_episodes=10_000, chips_per_player=500,
                 pg["lr"] = new_lr
             print(f"  [LR] Reduced to {new_lr:.2e} at episode {episode}")
 
-        # ── Self-play snapshot (save before building opponent) ────────────
-        if stage_idx == len(CURRICULUM) - 1:
-            if episode % SNAPSHOT_EVERY == 0:
+        # ── Self-play: save snapshot, then rebuild opponent if needed ─────
+        # Snapshot saved every SNAPSHOT_EVERY episodes; opponent rebuilt
+        # only when the snapshot changes (or first time we enter self-play).
+        in_selfplay = stage_idx == len(CURRICULUM) - 1
+        if in_selfplay:
+            snapshot_due = (episode % SNAPSHOT_EVERY == 0)
+            if snapshot_due:
                 os.makedirs("models", exist_ok=True)
                 rl_bot.save_model(SNAPSHOT_PATH)
+                # Force a rebuild from the new snapshot on this episode
+                selfplay_opponent = None
 
-        # ── Build opponent ────────────────────────────────────────────────
+            if selfplay_opponent is None and os.path.exists(SNAPSHOT_PATH):
+                selfplay_opponent = InProcessBot(
+                    RLBot(
+                        model_path=SNAPSHOT_PATH,
+                        training_mode=False,
+                        use_fallback=True,
+                    )
+                )
+
+        # ── Build opponent once per episode (reused for all hands) ────────
         seats = [
             Seat(player_id="P1", chips=chips_per_player),
             Seat(player_id="P2", chips=chips_per_player),
         ]
-        opponent_bot = CURRICULUM[stage_idx]["make_bot"]()
+        if in_selfplay and selfplay_opponent is not None:
+            opponent_bot = selfplay_opponent
+        else:
+            opponent_bot = CURRICULUM[stage_idx]["make_bot"]()
         bots = {
             "P1": opponent_bot,
             "P2": InProcessBot(rl_bot),
@@ -287,10 +302,12 @@ def train_rl_bot(num_episodes=10_000, chips_per_player=500,
                       f"{CURRICULUM[stage_idx]['name']}  "
                       f"(episode {episode}, rolling WR {rolling_wr:.1%})")
                 print(f"{'=' * 70}\n")
-                # Write initial snapshot when entering self-play
+                # Write initial snapshot when entering self-play,
+                # and force the opponent to be rebuilt next episode.
                 if stage_idx == len(CURRICULUM) - 1:
                     os.makedirs("models", exist_ok=True)
                     rl_bot.save_model(SNAPSHOT_PATH)
+                    selfplay_opponent = None   # will be built at top of next episode
                     print(f"  [snapshot] Initial self-play snapshot saved.\n")
             elif episode % 1_000 == 0:
                 # Periodic diagnostic: why haven't we promoted?
