@@ -51,8 +51,25 @@ def create_bot(btype: str) -> BotAdapter:
     if btype in ("random",):
         return InProcessBot(RandomBot())
 
+    if btype in ("icm", "icmbot"):
+        from bots.icm_bot import ICMBot
+        return _wrap(ICMBot())
+
+    if btype in ("exploitative", "exploitativebot"):
+        from bots.exploitative_bot import ExploitativeBot
+        return _wrap(ExploitativeBot())
+
+    if btype in ("gto", "gtobot"):
+        from bots.gto_bot import GTOBot
+        return _wrap(GTOBot())
+
+    if btype in ("opponentmodel", "opponentmodelbot"):
+        from bots.opponent_model_bot import OpponentModelBot
+        return _wrap(OpponentModelBot())
+
     raise ValueError(f"Unknown bot type: {btype!r}. "
-                     "Expected one of: mc, mc<N>, smart, ml, rl, rl:<path>, random")
+                     "Expected one of: mc, mc<N>, smart, ml, rl, rl:<path>, random, "
+                     "icm, exploitative, gto, opponentmodel")
 
 
 class _PlayerViewAdapter(BotAdapter):

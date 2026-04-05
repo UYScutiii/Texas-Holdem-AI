@@ -1,6 +1,6 @@
 # Texas Hold'em Bot
 
-A poker engine with pluggable AI bots. Comes with five bot types ranging from simple heuristics to neural network-based and game-theoretic strategies, a live tournament UI, and training pipelines for the ML and RL bots.
+A poker engine with pluggable AI bots. Comes with nine bot types ranging from simple heuristics to neural network-based, game-theoretic, and opponent-modeling strategies, a live tournament UI, and training pipelines for the ML and RL bots.
 
 ## Setup
 
@@ -46,8 +46,12 @@ The `--rl_model` flag automatically rewrites any `rl` entries in the `--players`
 ```
 .
 ├── core/               Game engine, bot interface, decision logger
-├── bots/               Bot implementations (Monte Carlo, Poker Mind, ML, RL, CFR)
-│   └── cfr_bot.py          Monte Carlo CFR bot
+├── bots/               Bot implementations (Monte Carlo, Poker Mind, ML, RL, CFR, ICM, Exploitative, GTO, Opponent Model)
+│   ├── cfr_bot.py              Monte Carlo CFR bot
+│   ├── icm_bot.py              Tournament equity (ICM) bot
+│   ├── exploitative_bot.py     Exploitative opponent-tracking bot
+│   ├── gto_bot.py              GTO approximation bot
+│   └── opponent_model_bot.py   Bayesian opponent-modeling bot
 ├── models/             Neural network architecture and saved model weights (.pt)
 ├── training/           Training scripts for ML and RL bots
 │   ├── train_rl_bot.py         Original fixed-opponent curriculum (random → heuristic → MC)
@@ -68,7 +72,7 @@ The game engine (`engine.py`) handles the full hand lifecycle: blinds, betting r
 
 ### bots/
 
-All four bot implementations live here. Each bot implements an `act(state) -> Action` method. The runner scripts import directly from this folder.
+All bot implementations live here. Each bot implements an `act(state) -> Action` method. The runner scripts import directly from this folder.
 
 ### models/
 
@@ -145,6 +149,30 @@ bot.save("models/cfr_regret.pkl")   # persist regret table
 bot2 = CFRBot()
 bot2.load("models/cfr_regret.pkl")  # resume from saved state
 ```
+
+### ICM Bot
+
+Tournament equity-aware bot using Malmuth-Harville Independent Chip Model (ICM) calculations. Rather than maximising chip EV directly, it estimates each player's tournament equity from current stack sizes and makes decisions that maximise equity preservation. Plays aggressively with a large stack (targeting short-stacked opponents) and tightens up when its own stack is threatened.
+
+Key: `icm` (or `icmbot`).
+
+### Exploitative Bot
+
+Adapts its strategy mid-session by tracking per-opponent statistics: Voluntarily Put in Pot (VPIP), aggression factor, and fold-to-aggression rate. For new opponents (fewer than 10 hands of history) it falls back to tight-aggressive (TAG) defaults. Once sufficient data is collected it exploits detected tendencies — bluffing against players who fold too much, value-betting against calling stations, and trapping against hyper-aggressors. Statistics are updated after every hand.
+
+Key: `exploitative` (or `exploitativebot`).
+
+### GTO Bot
+
+Approximates Game Theory Optimal play using position-aware preflop hand range charts and balanced mixed strategies postflop. Continuation bet frequency, check-raise frequency, and river bet sizing all target a 2:1 value-to-bluff ratio. Non-determinism is achieved via `random.random()` so the bot never plays a fixed, exploitable line.
+
+Key: `gto` (or `gtobot`).
+
+### Opponent Model Bot
+
+Bayesian hand-range modeling bot. Maintains a probability distribution over five hand-strength buckets (trash, weak, medium, strong, premium) for each opponent and updates those distributions using likelihood multipliers derived from observed actions (bets, raises, checks, folds). At decision time it runs Monte Carlo equity estimation against the weighted opponent range rather than against random hands, producing more accurate pot-odds calculations as the hand progresses.
+
+Key: `opponentmodel` (or `opponentmodelbot`).
 
 ## Training Scripts
 
