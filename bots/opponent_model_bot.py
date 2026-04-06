@@ -12,7 +12,7 @@ import random
 from typing import Optional
 import numpy as np
 from core.bot_api import Action, PlayerView
-from core.engine import eval_hand, EVAL_HAND_MAX, RANKS, SUITS
+from core.engine import eval_hand, EVAL_HAND_MAX, RANKS, SUITS, _FULL_DECK
 
 # ── Hand-strength buckets ────────────────────────────────────────────────────
 # Normalised eval_hand score thresholds (0.0–1.0)
@@ -278,26 +278,37 @@ class OpponentModelBot:
         wins = 0
         ties = 0
 
+        # Build the base used-card set and remaining deck ONCE before the loop.
+        base_used = set(tuple(c) for c in hole) | set(tuple(c) for c in board)
+        base_remaining = [c for c in _FULL_DECK if c not in base_used]
+        need_board = 5 - len(board)
+
         for _ in range(sims):
-            used = list(hole) + list(board)
+            sim_used = base_used.copy()
             opp_hands = []
             valid = True
 
             for opp in opponents:
                 opp_hole = self._sample_hand_from_range(
-                    opp, board, used
+                    opp, board, base_remaining, sim_used
                 )
                 if opp_hole is None:
                     valid = False
                     break
                 opp_hands.append(opp_hole)
-                used = used + list(opp_hole)
+                sim_used |= {tuple(c) for c in opp_hole}
 
             if not valid:
                 continue
 
-            # Complete the board
-            full_board = self._random_board(board, used)
+            # Complete the board from what's still available.
+            if need_board > 0:
+                avail_board = [c for c in base_remaining if c not in sim_used]
+                if len(avail_board) < need_board:
+                    continue
+                full_board = list(board) + random.sample(avail_board, need_board)
+            else:
+                full_board = list(board)
 
             my_score = eval_hand(hole, full_board)
             opp_scores = [eval_hand(oh, full_board) for oh in opp_hands]
@@ -312,16 +323,16 @@ class OpponentModelBot:
         return total / max(sims, 1)
 
     def _sample_hand_from_range(self, opp: str, board: list,
-                                 used: list):
+                                 base_remaining: list, sim_used: set):
         """Sample a 2-card hand for *opp* weighted by their bucket
-        distribution. Rejection-samples until a valid hand in the
-        target bucket is found."""
+        distribution. Receives the pre-filtered base_remaining list and
+        the current per-sim exclusion set to avoid rebuilding the deck."""
         dist = self._ranges.get(opp, _uniform_prior())
 
         # Pick a target bucket according to the distribution
         bucket_idx = int(np.random.choice(NUM_BUCKETS, p=dist))
 
-        deck = self._remaining_deck(used)
+        deck = [c for c in base_remaining if c not in sim_used]
         if len(deck) < 2:
             return None
 
@@ -342,12 +353,12 @@ class OpponentModelBot:
     # ── deck / board helpers (mirror MonteCarloBot) ──────────────────────
 
     def _remaining_deck(self, used):
-        full = [(r, s) for r in RANKS for s in SUITS]
         used_set = set(tuple(c) for c in used)
-        return [c for c in full if c not in used_set]
+        return [c for c in _FULL_DECK if c not in used_set]
 
     def _random_board(self, board, used):
-        deck = self._remaining_deck(used)
+        used_set = set(tuple(c) for c in used)
+        deck = [c for c in _FULL_DECK if c not in used_set]
         need = 5 - len(board)
         if need <= 0:
             return list(board)

@@ -9,9 +9,12 @@ Now with:
 from __future__ import annotations
 import random
 import warnings
+import pickle
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
-from collections import defaultdict, deque
+from collections import defaultdict, deque, Counter
+from itertools import combinations
 
 from .bot_api import Action, PlayerView, BotAdapter
 from core.logger import DecisionLogger # imports logger.py
@@ -26,61 +29,96 @@ Card = Tuple[str, str]
 # Use this to normalise hand strength to [0, 1].
 EVAL_HAND_MAX: int = (8 << 24) | 12  # 134_217_740
 
-def full_deck() -> List[Card]:
-    return [(r, s) for r in RANKS for s in SUITS]
+_FULL_DECK: List[Card] = [(r, s) for r in RANKS for s in SUITS]
+
+def _build_five_card_table() -> dict:
+    """
+    Precompute scores for all C(52,5) = 2,598,960 five-card hands.
+    Uses the original scoring logic exactly once at module load time.
+    Returns a dict keyed by a canonical sorted tuple of (rank_int, suit) pairs.
+    """
+    def _score(cards):
+        ranks = sorted([RANK_TO_INT[c[0]] for c in cards], reverse=True)
+        suits = [c[1] for c in cards]
+        is_flush = len(set(suits)) == 1
+
+        is_straight = False
+        straight_high = 0
+        if ranks[0] - ranks[4] == 4 and len(set(ranks)) == 5:
+            is_straight = True
+            straight_high = ranks[0]
+        elif ranks == [12, 3, 2, 1, 0]:  # A-5-4-3-2 wheel
+            is_straight = True
+            straight_high = 3  # 5-high
+
+        cnt = Counter(ranks)
+        freq = sorted(cnt.values(), reverse=True)
+        groups = sorted(cnt.keys(), key=lambda r: (cnt[r], r), reverse=True)
+
+        def pack(g):
+            v = 0
+            for r in g:
+                v = v * 15 + r
+            return v
+
+        if is_straight and is_flush:
+            return (8 << 24) | straight_high
+        if freq == [4, 1]:
+            return (7 << 24) | pack(groups)
+        if freq == [3, 2]:
+            return (6 << 24) | pack(groups)
+        if is_flush:
+            return (5 << 24) | pack(ranks)
+        if is_straight:
+            return (4 << 24) | straight_high
+        if freq[0] == 3:
+            return (3 << 24) | pack(groups)
+        if freq[:2] == [2, 2]:
+            return (2 << 24) | pack(groups)
+        if freq[0] == 2:
+            return (1 << 24) | pack(groups)
+        return (0 << 24) | pack(ranks)
+
+    table = {}
+    for combo in combinations(_FULL_DECK, 5):
+        # Key: sorted by (rank_int desc, suit) for a canonical form.
+        key = tuple(sorted(combo, key=lambda c: (-RANK_TO_INT[c[0]], c[1])))
+        table[key] = _score(list(combo))
+    return table
+
+
+# Load from disk if cached; build and save on first run.
+# Cache lives at models/five_card_table.pkl (≈ 50 MB).
+_TABLE_CACHE = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "models", "five_card_table.pkl",
+)
+
+def _load_or_build_five_card_table() -> dict:
+    if os.path.exists(_TABLE_CACHE):
+        try:
+            with open(_TABLE_CACHE, "rb") as fh:
+                return pickle.load(fh)
+        except Exception:
+            pass  # corrupted cache — fall through and rebuild
+    print("[engine] Building 5-card lookup table (one-time, ~15s) …", flush=True)
+    table = _build_five_card_table()
+    os.makedirs(os.path.dirname(_TABLE_CACHE), exist_ok=True)
+    with open(_TABLE_CACHE, "wb") as fh:
+        pickle.dump(table, fh, protocol=pickle.HIGHEST_PROTOCOL)
+    print(f"[engine] Table cached to {_TABLE_CACHE}", flush=True)
+    return table
+
+_FIVE_CARD_TABLE: dict = _load_or_build_five_card_table()
+
 
 def _score_five(cards: List[Card]) -> int:
     """
-    Score exactly 5 cards. Higher = better.
-    Hand ranks (multiplied by a large prime to separate categories):
-      8 = straight flush, 7 = quads, 6 = full house, 5 = flush,
-      4 = straight, 3 = trips, 2 = two pair, 1 = pair, 0 = high card
+    Score exactly 5 cards via a precomputed lookup table.
+    Higher = better.  Same output range as the original computation.
     """
-    from itertools import combinations as _comb
-    ranks = sorted([RANK_TO_INT[c[0]] for c in cards], reverse=True)
-    suits = [c[1] for c in cards]
-    is_flush = len(set(suits)) == 1
-
-    # Straight detection (including A-2-3-4-5 wheel)
-    is_straight = False
-    straight_high = 0
-    if ranks[0] - ranks[4] == 4 and len(set(ranks)) == 5:
-        is_straight = True
-        straight_high = ranks[0]
-    elif ranks == [12, 3, 2, 1, 0]:  # A-5-4-3-2 wheel
-        is_straight = True
-        straight_high = 3  # 5-high
-
-    from collections import Counter as _C
-    cnt = _C(ranks)
-    freq = sorted(cnt.values(), reverse=True)
-    groups = sorted(cnt.keys(), key=lambda r: (cnt[r], r), reverse=True)
-
-    # Category tiebreakers packed into a single int
-    # Each rank fits in 4 bits; pack up to 5 groups
-    def pack(g):
-        v = 0
-        for r in g:
-            v = v * 15 + r
-        return v
-
-    if is_straight and is_flush:
-        return (8 << 24) | straight_high
-    if freq == [4, 1]:
-        return (7 << 24) | pack(groups)
-    if freq == [3, 2]:
-        return (6 << 24) | pack(groups)
-    if is_flush:
-        return (5 << 24) | pack(ranks)
-    if is_straight:
-        return (4 << 24) | straight_high
-    if freq[0] == 3:
-        return (3 << 24) | pack(groups)
-    if freq[:2] == [2, 2]:
-        return (2 << 24) | pack(groups)
-    if freq[0] == 2:
-        return (1 << 24) | pack(groups)
-    return (0 << 24) | pack(ranks)
+    key = tuple(sorted(cards, key=lambda c: (-RANK_TO_INT[c[0]], c[1])))
+    return _FIVE_CARD_TABLE[key]
 
 
 def eval_hand(hole: List[Card], board: List[Card]) -> int:
@@ -91,7 +129,6 @@ def eval_hand(hole: List[Card], board: List[Card]) -> int:
     Uses all combinations of hole + board cards and returns the best 5-card score.
     Falls back to a simple preflop heuristic when fewer than 3 board cards exist.
     """
-    from itertools import combinations
     all_cards = list(hole) + list(board)
     if len(all_cards) >= 5:
         return max(_score_five(list(combo)) for combo in combinations(all_cards, 5))
@@ -312,7 +349,7 @@ class Table:
         post_blind("BB", bb_idx, big_blind)
 
         # Shuffle and deal
-        self._deck = full_deck()
+        self._deck = list(_FULL_DECK)
         self.rng.shuffle(self._deck)
         hole = {seats[idx].player_id: [self._deck.pop(), self._deck.pop()] for idx in ring}
         board: List[Card] = []

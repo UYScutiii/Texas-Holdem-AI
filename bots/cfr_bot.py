@@ -23,7 +23,7 @@ from itertools import combinations
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.bot_api import Action, PlayerView
-from core.engine import eval_hand, full_deck, EVAL_HAND_MAX
+from core.engine import eval_hand, _FULL_DECK, EVAL_HAND_MAX
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Constants
@@ -44,7 +44,7 @@ ABSTRACT_ACTIONS: List[str] = [
 NUM_ACTIONS = len(ABSTRACT_ACTIONS)
 
 # Number of Monte Carlo rollouts for postflop hand-strength estimation
-_HS_SIMS = 200
+_HS_SIMS = 20
 
 # Number of preflop buckets (hand-strength tiers)
 _PREFLOP_BUCKETS = 10
@@ -102,7 +102,7 @@ def _postflop_bucket(hole: List[Tuple[str, str]],
         return _POSTFLOP_BUCKETS // 2  # neutral bucket
 
     used = set(tuple(c) for c in hole) | set(tuple(c) for c in board)
-    remaining = [c for c in full_deck() if c not in used]
+    remaining = [c for c in _FULL_DECK if c not in used]
 
     wins = 0
     total = 0
@@ -112,8 +112,8 @@ def _postflop_bucket(hole: List[Tuple[str, str]],
             break
         opp_hand = random.sample(remaining, 2)
         # Complete board to 5 cards if needed
-        used_sim = used | set(tuple(c) for c in opp_hand)
-        rest = [c for c in remaining if c not in set(tuple(c) for c in opp_hand)]
+        opp_set = {tuple(opp_hand[0]), tuple(opp_hand[1])}
+        rest = [c for c in remaining if tuple(c) not in opp_set]
         need = 5 - len(board)
         if need > 0:
             if len(rest) < need:
@@ -473,6 +473,10 @@ class CFRBot:
         """
         node = self._get_node(info_key)
 
+        # Compute equity once per decision point (outside the iteration loop)
+        # so that the Monte-Carlo rollout is not repeated on every iteration.
+        equity = self._quick_equity(hole, board)
+
         for _ in range(self.iterations):
             strategy = node.get_strategy(legal_mask)
 
@@ -483,9 +487,7 @@ class CFRBot:
             # Compute utility for each legal abstract action via rollout
             action_values = {}
             for a in legal_mask:
-                action_values[a] = self._estimate_action_value(
-                    a, pot, hole, board, street
-                )
+                action_values[a] = self._estimate_action_value(a, pot, equity)
 
             # Expected value under current strategy
             ev = sum(strategy[a] * action_values.get(a, 0.0) for a in legal_mask)
@@ -501,9 +503,7 @@ class CFRBot:
         self,
         abstract_idx: int,
         pot: int,
-        hole: List[Tuple[str, str]],
-        board: List[Tuple[str, str]],
-        street: str,
+        equity: float,
     ) -> float:
         """
         Estimate the expected value of taking the given abstract action.
@@ -513,12 +513,10 @@ class CFRBot:
           * check/call → equity × pot (minus cost to call, estimated)
           * bet/raise → equity × (pot + sizing) adjusted for fold equity
 
-        Equity is estimated via Monte-Carlo rollout.
+        ``equity`` is a pre-computed Monte-Carlo equity estimate in [0, 1]
+        passed in from ``_run_iterations`` to avoid redundant rollouts.
         """
         label = ABSTRACT_ACTIONS[abstract_idx]
-
-        # Quick equity estimate
-        equity = self._quick_equity(hole, board)
 
         if label == "fold":
             return -1.0
@@ -567,17 +565,18 @@ class CFRBot:
             return 0.3 + 0.5 * (bucket / (_PREFLOP_BUCKETS - 1))
 
         used = set(tuple(c) for c in hole) | set(tuple(c) for c in board)
-        remaining = [c for c in full_deck() if c not in used]
+        remaining = [c for c in _FULL_DECK if c not in used]
 
         wins = 0
         total = 0
-        sims = 80  # fewer sims for speed during MCCFR iterations
+        sims = 20  # fewer sims for speed during MCCFR iterations
 
         for _ in range(sims):
             if len(remaining) < 2:
                 break
             opp = random.sample(remaining, 2)
-            rest = [c for c in remaining if c not in set(tuple(x) for x in opp)]
+            opp_set = {tuple(opp[0]), tuple(opp[1])}
+            rest = [c for c in remaining if tuple(c) not in opp_set]
             need = 5 - len(board)
             if need > 0 and len(rest) < need:
                 continue

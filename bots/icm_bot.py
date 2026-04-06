@@ -18,7 +18,7 @@ import random
 import math
 from itertools import combinations
 from core.bot_api import Action, PlayerView
-from core.engine import eval_hand, EVAL_HAND_MAX
+from core.engine import eval_hand, EVAL_HAND_MAX, _FULL_DECK
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -282,15 +282,36 @@ class ICMBot:
         ties = 0
         sims = self.simulations
 
-        for _ in range(sims):
-            used = list(hole) + list(board)
-            opp_hands = []
-            for _ in range(num_opponents):
-                opp = self._random_hand(used)
-                opp_hands.append(opp)
-                used = used + list(opp)
+        # Build the used-card set and remaining deck ONCE before the loop.
+        base_used = set(tuple(c) for c in hole) | set(tuple(c) for c in board)
+        base_remaining = [c for c in _FULL_DECK if c not in base_used]
+        need_board = 5 - len(board)
 
-            full_board = self._complete_board(board, used)
+        for _ in range(sims):
+            sim_used = base_used.copy()
+            opp_hands = []
+            valid = True
+
+            for _ in range(num_opponents):
+                avail = [c for c in base_remaining if c not in sim_used]
+                if len(avail) < 2:
+                    valid = False
+                    break
+                opp = random.sample(avail, 2)
+                opp_hands.append(opp)
+                sim_used |= {tuple(c) for c in opp}
+
+            if not valid:
+                continue
+
+            if need_board > 0:
+                avail_board = [c for c in base_remaining if c not in sim_used]
+                if len(avail_board) < need_board:
+                    continue
+                full_board = list(board) + random.sample(avail_board, need_board)
+            else:
+                full_board = list(board)
+
             my_score = eval_hand(hole, full_board)
 
             opp_scores = [eval_hand(opp, full_board) for opp in opp_hands]
@@ -349,11 +370,8 @@ class ICMBot:
         return board + random.sample(deck, need)
 
     def _remaining_deck(self, used):
-        ranks = "23456789TJQKA"
-        suits = "cdhs"
-        full = [(r, s) for r in ranks for s in suits]
         used_set = set(tuple(c) for c in used)
-        return [c for c in full if c not in used_set]
+        return [c for c in _FULL_DECK if c not in used_set]
 
     # ── Action helpers ───────────────────────────────────────────────────
 

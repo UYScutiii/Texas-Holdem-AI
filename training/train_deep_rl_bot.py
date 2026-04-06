@@ -1,20 +1,23 @@
 """
 training/train_deep_rl_bot.py
 ─────────────────────────────
-Multi-opponent PPO training for RLBot.
+Multi-player PPO training for RLBot.
 
-Opponent pool
-─────────────
-Each episode, one opponent is drawn *uniformly at random* (without repeating
-the same one two episodes in a row) from:
+Table layout
+────────────
+Every episode seats the RL bot at a 4-player table alongside all three
+pool opponents simultaneously:
   • CFRBot         — loads models/cfr_regret.pkl if it exists
   • MonteCarloBot  — 500 simulations per decision
   • GTOBot         — balanced mixed strategy
 
+Seat assignments are shuffled randomly each episode so the RL bot
+experiences every table position (BTN, SB, BB, UTG) equally.
+
 Reward signal
 ─────────────
 Per-hand normalised chip delta only:
-    reward = (chips_after − chips_before) / max(chips_before, 1)
+    reward = (chips_after_RL − chips_before_RL) / max(chips_before_RL, 1)
 
 No asymmetric terminal win/loss bonus is applied.
 
@@ -73,6 +76,8 @@ class _PlayerViewAdapter(BotAdapter):
         return self.bot.act(view)
 
 
+# ── Opponent pool (built once before the training loop) ───────────────────────
+
 def _build_opponent_pool() -> list[tuple[str, BotAdapter]]:
     """
     Construct every pool opponent exactly once.
@@ -82,7 +87,7 @@ def _build_opponent_pool() -> list[tuple[str, BotAdapter]]:
     path = CFR_PROFILE_PATH if os.path.exists(CFR_PROFILE_PATH) else None
     pool = [
         ("cfr",   _PlayerViewAdapter(CFRBot(profile_path=path))),
-        ("mc500", _PlayerViewAdapter(MonteCarloBot(simulations=500))),
+        ("mc200", _PlayerViewAdapter(MonteCarloBot(simulations=200))),
         ("gto",   _PlayerViewAdapter(GTOBot())),
     ]
     names = ", ".join(n for n, _ in pool)
@@ -93,30 +98,26 @@ def _build_opponent_pool() -> list[tuple[str, BotAdapter]]:
 # ── Main training function ────────────────────────────────────────────────────
 
 def train_deep_rl_bot(
-    num_episodes:    int = 20_000,
+    num_episodes:     int = 20_000,
     chips_per_player: int = 500,
-    csv_path:        str | None = None,
+    csv_path:         str | None = None,
     lr_step_episodes: int = 20_000,
-    load_checkpoint: bool = True,
+    load_checkpoint:  bool = True,
 ):
     """
-    Train RLBot against a rotating opponent pool with pure per-hand rewards.
+    Train RLBot at a 4-player table alongside CFRBot, MC500, and GTOBot.
 
-    Args:
-        num_episodes:     Number of tournament episodes (each: play until one
-                          player is eliminated, up to 10 000 hands).
-        chips_per_player: Starting chip count for both players.
-        csv_path:         Optional path for the per-episode CSV log.
-        lr_step_episodes: Halve the learning rate every this many episodes.
-        load_checkpoint:  If True, load FINAL_MODEL_PATH when it exists.
+    Each episode randomly shuffles the four seats so the RL bot trains from
+    every table position (BTN, SB, BB, UTG) across the run.  Reward is the
+    per-hand normalised chip delta for the RL seat only.
     """
     print("=" * 70)
-    print("TRAINING RLBot  (deep multi-opponent pool)")
+    print("TRAINING RLBot  (4-player multi-opponent table)")
     print("=" * 70)
     print(f"Episodes:            {num_episodes}")
     print(f"Chips per player:    {chips_per_player}")
     print(f"Hidden size:         {HIDDEN_SIZE}")
-    print(f"Opponent pool:       cfr, mc500, gto")
+    print(f"Opponent pool:       cfr, mc200, gto  (seats shuffled each ep)")
     print(f"Reward signal:       per-hand normalised chip delta (no terminal bonus)")
     print(f"Checkpoint:          {FINAL_MODEL_PATH}")
     print(f"LR step every:       {lr_step_episodes} episodes")
@@ -161,25 +162,24 @@ def train_deep_rl_bot(
         csv_file   = open(csv_path, "w", newline="")
         csv_writer = csv.writer(csv_file)
         csv_writer.writerow([
-            "episode", "opponent", "won", "hands_played",
+            "episode", "rl_seat", "won", "hands_played",
             "episode_reward", "rolling_wr", "avg_reward", "lr",
         ])
 
-    # ── Build opponent pool (once — no reloading inside the loop) ────────────
-    opponent_pool = _build_opponent_pool()
+    # ── Build opponent pool once (no reloading inside the loop) ──────────────
+    opponent_pool = _build_opponent_pool()   # list of (name, BotAdapter)
 
     # ── Training state ────────────────────────────────────────────────────────
     table          = Table()
     wins           = 0
     recent_rewards = deque(maxlen=100)
-    prev_opp_idx: int | None = None
 
     print(f"[train] Starting training loop …\n")
 
     # ── Main training loop ────────────────────────────────────────────────────
     for episode in range(1, num_episodes + 1):
 
-        # Flush previous episode's buffer into the batch
+        # Flush the previous episode's trajectory into the PPO batch buffer
         rl_bot.end_episode()
         rl_bot.opponent_stats = {}
 
@@ -191,35 +191,46 @@ def train_deep_rl_bot(
                 pg["lr"] = new_lr
             print(f"  [LR] Decayed to {new_lr:.2e} at episode {episode}")
 
-        # ── Sample opponent (no repeat, no reconstruction) ───────────────────
-        n       = len(opponent_pool)
-        choices = [i for i in range(n) if i != prev_opp_idx]
-        opp_idx = random.choice(choices)
-        prev_opp_idx  = opp_idx
-        opp_name, opponent_bot = opponent_pool[opp_idx]
+        # ── Build shuffled 4-player roster ───────────────────────────────────
+        # Combine all 3 pool opponents with the RL bot, shuffle, then assign
+        # player IDs P1–P4 in order.  The RL bot ends up at a random seat
+        # (and therefore a random table position) each episode.
+        roster = list(opponent_pool) + [("rl", None)]   # None → use rl_bot
+        random.shuffle(roster)
 
-        # ── Set up table seats ────────────────────────────────────────────────
-        seats = [
-            Seat(player_id="P1", chips=chips_per_player),  # opponent
-            Seat(player_id="P2", chips=chips_per_player),  # RL agent
-        ]
-        bots = {
-            "P1": InProcessBot(opponent_bot),
-            "P2": InProcessBot(rl_bot),
-        }
+        seats: list[Seat]          = []
+        bots:  dict[str, BotAdapter] = {}
+        rl_pid: str                = ""
 
-        # ── Play until elimination or hand-count safety limit ─────────────────
-        hand_count    = 0
-        dealer_index  = 0
+        for i, (name, adapter) in enumerate(roster):
+            pid = f"P{i + 1}"
+            seats.append(Seat(player_id=pid, chips=chips_per_player))
+            if name == "rl":
+                bots[pid] = InProcessBot(rl_bot)
+                rl_pid    = pid
+            else:
+                bots[pid] = InProcessBot(adapter)
+
+        rl_seat_label = rl_pid   # e.g. "P3" — logged in CSV / progress
+
+        # ── Play until one player remains or hand-count safety limit ──────────
+        hand_count     = 0
+        dealer_index   = 0
         episode_reward = 0.0
+        winner_pid     = None
 
         while True:
             active_seats = [s for s in seats if s.chips > 0]
+
             if len(active_seats) <= 1:
-                winner = active_seats[0].player_id if active_seats else None
+                winner_pid = active_seats[0].player_id if active_seats else None
                 break
 
-            chips_before_p2 = sum(s.chips for s in seats if s.player_id == "P2")
+            # Capture RL bot's chip count before this hand (0 if already bust)
+            rl_seat_before = next(
+                (s for s in active_seats if s.player_id == rl_pid), None
+            )
+            chips_before_rl = rl_seat_before.chips if rl_seat_before else 0
 
             result = table.play_hand(
                 seats=active_seats,
@@ -231,10 +242,15 @@ def train_deep_rl_bot(
                 log_decisions=False,
             )
 
-            # Per-hand reward: normalised chip delta only (no terminal bonus)
-            chips_after_p2 = sum(s.chips for s in seats if s.player_id == "P2")
-            if "P2" in result:
-                hand_reward = (chips_after_p2 - chips_before_p2) / max(chips_before_p2, 1)
+            # Per-hand reward: normalised chip delta for the RL bot only.
+            # Seat objects are mutated in-place by the engine, so reading
+            # chips from the Seat after play_hand gives the post-hand count.
+            if rl_pid in result and chips_before_rl > 0:
+                rl_seat_after  = next(
+                    (s for s in seats if s.player_id == rl_pid), None
+                )
+                chips_after_rl = rl_seat_after.chips if rl_seat_after else 0
+                hand_reward    = (chips_after_rl - chips_before_rl) / chips_before_rl
                 rl_bot.record_reward(hand_reward)
                 episode_reward += hand_reward
 
@@ -242,11 +258,11 @@ def train_deep_rl_bot(
             hand_count  += 1
 
             if hand_count > 10_000:          # safety limit
-                winner = max(seats, key=lambda s: s.chips).player_id
+                winner_pid = max(seats, key=lambda s: s.chips).player_id
                 break
 
         # ── Episode outcome ───────────────────────────────────────────────────
-        won = (winner == "P2")
+        won = (winner_pid == rl_pid)
         if won:
             wins += 1
         recent_rewards.append(episode_reward)
@@ -257,7 +273,7 @@ def train_deep_rl_bot(
             avg_reward = sum(recent_rewards) / len(recent_rewards)
             current_lr = rl_bot.optimizer.param_groups[0]["lr"]
             csv_writer.writerow([
-                episode, opp_name, int(won), hand_count,
+                episode, rl_seat_label, int(won), hand_count,
                 f"{episode_reward:.4f}", f"{rolling_wr:.4f}",
                 f"{avg_reward:.4f}", f"{current_lr:.2e}",
             ])
@@ -270,7 +286,7 @@ def train_deep_rl_bot(
             print(
                 f"  ep={episode:>6}  wins={wins:>5}  wr={rolling_wr:.1%}  "
                 f"avg_r={avg_reward:+.3f}  lr={current_lr:.1e}  "
-                f"last_opp={opp_name}"
+                f"rl_seat={rl_seat_label}"
             )
 
     # ── End of training ───────────────────────────────────────────────────────
@@ -289,7 +305,7 @@ def train_deep_rl_bot(
     print(f"\n{'=' * 70}")
     print("Training complete.")
     print(f"  Episodes:              {num_episodes}")
-    print(f"  Wins:                  {wins} / {num_episodes}  ({final_wr:.1%})")
+    print(f"  Wins (1st place):      {wins} / {num_episodes}  ({final_wr:.1%})")
     print(f"  Avg reward (last 100): {avg_final:+.3f}")
     print(f"{'=' * 70}")
 
@@ -301,8 +317,8 @@ def train_deep_rl_bot(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description=(
-            "Train RLBot against a rotating pool of CFRBot, "
-            "MonteCarloBot(500), and GTOBot using PPO."
+            "Train RLBot at a 4-player table alongside "
+            "CFRBot, MonteCarloBot(200), and GTOBot using PPO."
         )
     )
     parser.add_argument(

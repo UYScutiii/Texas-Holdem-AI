@@ -1,6 +1,6 @@
 import random
 from core.bot_api import Action, PlayerView
-from core.engine import eval_hand
+from core.engine import eval_hand, _FULL_DECK
 
 
 class MonteCarloBot:
@@ -94,17 +94,38 @@ class MonteCarloBot:
         wins = 0
         ties = 0
 
-        for _ in range(sims):
-            # Deal hands for all opponents
-            used = list(hole) + list(board)
-            opp_hands = []
-            for _ in range(num_opponents):
-                opp = self._random_hand(used)
-                opp_hands.append(opp)
-                used = used + list(opp)
+        # Build the used-card set and remaining deck ONCE before the loop.
+        base_used = set(tuple(c) for c in hole) | set(tuple(c) for c in board)
+        base_remaining = [c for c in _FULL_DECK if c not in base_used]
+        need_board = 5 - len(board)
 
-            # Complete the board
-            full_board = self._random_board(board, used)
+        for _ in range(sims):
+            # Per-sim exclusion grows as we deal opponent hands.
+            sim_used = base_used.copy()
+            remaining = base_remaining  # read-only reference; filter inline below
+            opp_hands = []
+            valid = True
+
+            for _ in range(num_opponents):
+                avail = [c for c in remaining if c not in sim_used]
+                if len(avail) < 2:
+                    valid = False
+                    break
+                opp = random.sample(avail, 2)
+                opp_hands.append(opp)
+                sim_used |= {tuple(c) for c in opp}
+
+            if not valid:
+                continue
+
+            # Complete the board from what's still available.
+            if need_board > 0:
+                avail_board = [c for c in base_remaining if c not in sim_used]
+                if len(avail_board) < need_board:
+                    continue
+                full_board = list(board) + random.sample(avail_board, need_board)
+            else:
+                full_board = list(board)
 
             my_score = eval_hand(hole, full_board)
 
@@ -120,31 +141,11 @@ class MonteCarloBot:
         return (wins + ties * 0.5) / sims
 
     # ----------------------------------------------------
-    # Deal a random 2-card hand avoiding used cards
-    # ----------------------------------------------------
-    def _random_hand(self, used):
-        deck = self._remaining_deck(used)
-        return random.sample(deck, 2)
-
-    # ----------------------------------------------------
-    # Complete the board to 5 cards randomly
-    # ----------------------------------------------------
-    def _random_board(self, board, used):
-        deck = self._remaining_deck(used)
-        need = 5 - len(board)
-        cards = random.sample(deck, need)
-        return board + cards
-
-    # ----------------------------------------------------
-    # Remaining deck helper
+    # Remaining deck helper (used outside _estimate_equity)
     # ----------------------------------------------------
     def _remaining_deck(self, used):
-        ranks = "23456789TJQKA"
-        suits = "cdhs"
-
-        full = [(r, s) for r in ranks for s in suits]
         used_set = set(tuple(c) for c in used)
-        return [c for c in full if c not in used_set]
+        return [c for c in _FULL_DECK if c not in used_set]
 
     # ----------------------------------------------------
     # Helper: choose legal action
