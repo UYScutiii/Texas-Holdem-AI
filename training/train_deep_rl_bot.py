@@ -73,40 +73,21 @@ class _PlayerViewAdapter(BotAdapter):
         return self.bot.act(view)
 
 
-# ── Opponent factory helpers ──────────────────────────────────────────────────
-
-def _make_cfr() -> BotAdapter:
-    """Construct CFRBot; silently skips profile load if file is absent."""
+def _build_opponent_pool() -> list[tuple[str, BotAdapter]]:
+    """
+    Construct every pool opponent exactly once.
+    Returns a list of (name, adapter) pairs that are reused for the entire
+    training run — no bot is ever reconstructed or reloaded inside the loop.
+    """
     path = CFR_PROFILE_PATH if os.path.exists(CFR_PROFILE_PATH) else None
-    return _PlayerViewAdapter(CFRBot(profile_path=path))
-
-
-def _make_mc500() -> BotAdapter:
-    return _PlayerViewAdapter(MonteCarloBot(simulations=500))
-
-
-def _make_gto() -> BotAdapter:
-    return _PlayerViewAdapter(GTOBot())
-
-
-# Pool entry format: {"name": str, "factory": callable → BotAdapter}
-OPPONENT_POOL = [
-    {"name": "cfr",   "factory": _make_cfr},
-    {"name": "mc500", "factory": _make_mc500},
-    {"name": "gto",   "factory": _make_gto},
-]
-
-
-def _sample_opponent(prev_idx: int | None) -> tuple[int, BotAdapter]:
-    """
-    Pick a random pool index, avoiding the same opponent as last episode.
-    Returns (new_idx, fresh_bot_instance).
-    """
-    n = len(OPPONENT_POOL)
-    choices = [i for i in range(n) if i != prev_idx]
-    idx = random.choice(choices)
-    bot = OPPONENT_POOL[idx]["factory"]()
-    return idx, bot
+    pool = [
+        ("cfr",   _PlayerViewAdapter(CFRBot(profile_path=path))),
+        ("mc500", _PlayerViewAdapter(MonteCarloBot(simulations=500))),
+        ("gto",   _PlayerViewAdapter(GTOBot())),
+    ]
+    names = ", ".join(n for n, _ in pool)
+    print(f"[pool] Built {len(pool)} opponent(s): {names}")
+    return pool
 
 
 # ── Main training function ────────────────────────────────────────────────────
@@ -135,7 +116,7 @@ def train_deep_rl_bot(
     print(f"Episodes:            {num_episodes}")
     print(f"Chips per player:    {chips_per_player}")
     print(f"Hidden size:         {HIDDEN_SIZE}")
-    print(f"Opponent pool:       {', '.join(e['name'] for e in OPPONENT_POOL)}")
+    print(f"Opponent pool:       cfr, mc500, gto")
     print(f"Reward signal:       per-hand normalised chip delta (no terminal bonus)")
     print(f"Checkpoint:          {FINAL_MODEL_PATH}")
     print(f"LR step every:       {lr_step_episodes} episodes")
@@ -184,6 +165,9 @@ def train_deep_rl_bot(
             "episode_reward", "rolling_wr", "avg_reward", "lr",
         ])
 
+    # ── Build opponent pool (once — no reloading inside the loop) ────────────
+    opponent_pool = _build_opponent_pool()
+
     # ── Training state ────────────────────────────────────────────────────────
     table          = Table()
     wins           = 0
@@ -207,10 +191,12 @@ def train_deep_rl_bot(
                 pg["lr"] = new_lr
             print(f"  [LR] Decayed to {new_lr:.2e} at episode {episode}")
 
-        # ── Sample opponent (no repeat) ───────────────────────────────────────
-        opp_idx, opponent_bot = _sample_opponent(prev_opp_idx)
-        prev_opp_idx          = opp_idx
-        opp_name              = OPPONENT_POOL[opp_idx]["name"]
+        # ── Sample opponent (no repeat, no reconstruction) ───────────────────
+        n       = len(opponent_pool)
+        choices = [i for i in range(n) if i != prev_opp_idx]
+        opp_idx = random.choice(choices)
+        prev_opp_idx  = opp_idx
+        opp_name, opponent_bot = opponent_pool[opp_idx]
 
         # ── Set up table seats ────────────────────────────────────────────────
         seats = [
