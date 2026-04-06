@@ -22,6 +22,7 @@ def create_bot(btype: str) -> BotAdapter:
       smart              SmartBot (heuristic)
       ml                 MLBot (supervised learning)
       rl, rl:<path>      RLBot (reinforcement learning, with optional model path)
+      cfr                CFRBot (MCCFR, loads models/cfr_regret.pkl by default)
       random             RandomBot
     """
     btype = btype.strip().lower()
@@ -67,9 +68,13 @@ def create_bot(btype: str) -> BotAdapter:
         from bots.opponent_model_bot import OpponentModelBot
         return _wrap(OpponentModelBot())
 
+    if btype in ("cfr", "cfrbot"):
+        from bots.cfr_bot import CFRBot
+        return _wrap(CFRBot(profile_path="models/cfr_regret.pkl"))
+
     raise ValueError(f"Unknown bot type: {btype!r}. "
                      "Expected one of: mc, mc<N>, smart, ml, rl, rl:<path>, random, "
-                     "icm, exploitative, gto, opponentmodel")
+                     "cfr, icm, exploitative, gto, opponentmodel")
 
 
 class _PlayerViewAdapter(BotAdapter):
