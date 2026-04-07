@@ -38,7 +38,7 @@ from bots import parse_players, escalate_blinds
 
 # ─── DEFAULTS ────────────────────────────────────────────────────────────────
 
-DEFAULT_PLAYERS = "mc200,smart,mc100,smart,ml,rl"
+DEFAULT_PLAYERS = "mc200,smart,ml,rl,cfr,icm,exploitative,gto,opponentmodel"
 DEFAULT_CHIPS   = 1000
 DEFAULT_SB      = 5
 DEFAULT_BB      = 10
@@ -76,6 +76,9 @@ class TournamentUI:
         self.running      = False
         self.finished     = False
         self._current_blinds = (base_sb, base_bb)
+        self._cancel_event   = threading.Event()
+        self._cancelled      = False
+        self._btn_mode       = "play"  # "play" | "cancel" | "restart"
 
         self._build_figure()
 
@@ -145,7 +148,7 @@ class TournamentUI:
         )
         self.play_btn.label.set_color("white")
         self.play_btn.label.set_fontsize(13)
-        self.play_btn.on_clicked(self._on_play)
+        self.play_btn.on_clicked(self._on_button_click)
 
         # Keyboard handler
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
@@ -173,17 +176,33 @@ class TournamentUI:
         self.status_text.set_text(f"Running  |  {state}  |  +/- speed  |  Space pause")
         self.fig.canvas.draw_idle()
 
-    # ── Button handler ────────────────────────────────────────────────────────
+    # ── Button dispatcher ─────────────────────────────────────────────────────
 
-    def _on_play(self, event=None):
+    def _on_button_click(self, event=None):
+        if self._btn_mode == "play":
+            self._start_tournament()
+        elif self._btn_mode == "cancel":
+            self._request_cancel()
+        elif self._btn_mode == "restart":
+            self._reset_to_play()
+
+    def _start_tournament(self):
         if self.running or self.finished:
             return
+        self._cancel_event.clear()
+        self._cancelled = False
         self.running = True
         self._dirty = False
         self._winner_info = None
-        self.play_btn.label.set_text("Running...")
-        self.play_btn.color = "#333355"
+        # Switch to Cancel mode
+        self._btn_mode = "cancel"
+        self.play_btn.label.set_text("Cancel")
+        self.play_btn.color = "#7a1a1a"
+        self.play_btn.hovercolor = "#c0392b"
+        self.play_btn.ax.set_facecolor("#7a1a1a")
         self.status_text.set_text("Tournament in progress...  |  +/- speed  |  Space pause")
+        self.status_text.set_color("#aaaaaa")
+        self.status_text.set_style("italic")
         self.fig.canvas.draw_idle()
 
         self._timer = self.fig.canvas.new_timer(interval=50)
@@ -192,6 +211,45 @@ class TournamentUI:
 
         t = threading.Thread(target=self._run_tournament, daemon=True)
         t.start()
+
+    def _request_cancel(self):
+        """Signal the tournament thread to stop; UI reset happens in _poll_redraw."""
+        self._cancel_event.set()
+        self.play_btn.label.set_text("Stopping...")
+        self.play_btn.color = "#444444"
+        self.play_btn.ax.set_facecolor("#444444")
+        self.status_text.set_text("Cancelling...")
+        self.fig.canvas.draw_idle()
+
+    def _reset_to_play(self):
+        """Reset all state and restore the chart to the initial ready state."""
+        self.chip_history = []
+        self.running = False
+        self.finished = False
+        self._cancelled = False
+        self._cancel_event.clear()
+        self._winner_info = None
+        self._current_blinds = (self.base_sb, self.base_bb)
+        # Restore button to Play
+        self._btn_mode = "play"
+        self.play_btn.label.set_text("Play")
+        self.play_btn.color = "#0f3460"
+        self.play_btn.hovercolor = "#e94560"
+        self.play_btn.ax.set_facecolor("#0f3460")
+        # Restore status text
+        self.status_text.set_text(
+            "Press  Play  to start  |  +/- speed  |  Space pause")
+        self.status_text.set_color("#aaaaaa")
+        self.status_text.set_style("italic")
+        # Restore chart lines to flat starting chips
+        for pid, line in self.lines.items():
+            line.set_data([0], [self.starting_chips])
+        total_chips = self.starting_chips * len(self.player_ids)
+        self.ax.set_xlim(0, 10)
+        self.ax.set_ylim(0, total_chips * 1.05)
+        self.blinds_text.set_text(
+            f"Blinds: {self.base_sb}/{self.base_bb}")
+        self.fig.canvas.draw_idle()
 
     # ── Tournament loop ───────────────────────────────────────────────────────
 
@@ -212,9 +270,13 @@ class TournamentUI:
         total        = len(seats)
 
         while len(active_seats) > 1:
-            # Pause loop
-            while self._paused:
-                time.sleep(0.1)
+            # Cancellation check (runs before every hand)
+            if self._cancel_event.is_set():
+                self._signal_cancelled()
+                return
+            # Pause loop — also exits immediately on cancel
+            while self._paused and not self._cancel_event.is_set():
+                time.sleep(0.05)
 
             hand_num += 1
             sb, bb = escalate_blinds(hand_num, self.base_sb, self.base_bb,
@@ -263,6 +325,11 @@ class TournamentUI:
     def _mark_dirty(self):
         self._dirty = True
 
+    def _signal_cancelled(self):
+        """Called from the tournament thread when the cancel event fires."""
+        self._cancelled = True
+        self._dirty = True
+
     def _signal_finish(self, winner: str, hands_played: int):
         self._winner_info = (winner, hands_played)
         self._dirty = True
@@ -284,6 +351,13 @@ class TournamentUI:
         sb, bb = self._current_blinds
         self.blinds_text.set_text(f"Blinds: {sb}/{bb}")
 
+        # Cancellation: reset everything back to ready state
+        if self._cancelled:
+            self._timer.stop()
+            self.running = False
+            self._reset_to_play()
+            return
+
         if self._winner_info is not None:
             winner, hands_played = self._winner_info
             self._timer.stop()
@@ -293,7 +367,13 @@ class TournamentUI:
             self.status_text.set_text(
                 f"{winner} wins!   ({hands_played} hands played)")
             self.status_text.set_color(colour)
-            self.play_btn.label.set_text("Done")
+            self.status_text.set_style("normal")
+            # Switch to Restart mode
+            self._btn_mode = "restart"
+            self.play_btn.label.set_text("Restart")
+            self.play_btn.color = "#0f3460"
+            self.play_btn.hovercolor = "#e94560"
+            self.play_btn.ax.set_facecolor("#0f3460")
             print(f"\nWinner: {winner}  ({hands_played} hands)")
 
         self.fig.canvas.draw_idle()
