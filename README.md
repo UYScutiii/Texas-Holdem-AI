@@ -1,6 +1,6 @@
 # Texas Hold'em Bot
 
-A poker engine with pluggable AI bots. Comes with nine bot types ranging from simple heuristics to neural network-based, game-theoretic, and opponent-modeling strategies, a live tournament UI, and training pipelines for the ML and RL bots.
+A poker engine with pluggable AI bots. Ships with nine bot types ranging from simple heuristics to neural-network, reinforcement-learning, game-theoretic, and opponent-modeling strategies, plus a live tournament UI, batch statistics runner, and training pipelines for the ML, RL, and CFR bots.
 
 ## Setup
 
@@ -8,7 +8,7 @@ A poker engine with pluggable AI bots. Comes with nine bot types ranging from si
 pip install -r requirements.txt
 ```
 
-Dependencies: PyTorch, Matplotlib, treys.
+Dependencies: PyTorch (>= 1.9), Matplotlib (>= 3.5), treys (>= 0.1.8).
 
 ## Running
 
@@ -29,13 +29,8 @@ python run_tournament_stats.py --tournaments 100 --chips 500
 
 **Testing a specific RL model checkpoint**:
 ```bash
-# Test a specific RL model in a single tournament
 python run_local_match.py --rl_model models/rl_model_run3.pt
-
-# Test a specific RL model in batch statistics
 python run_tournament_stats.py --tournaments 50 --rl_model models/rl_model_run3.pt
-
-# Test a specific RL model in the interactive UI
 python run_tournament.py --rl_model models/rl_model_run3.pt
 ```
 
@@ -45,164 +40,171 @@ The `--rl_model` flag automatically rewrites any `rl` entries in the `--players`
 
 ```
 .
-├── core/               Game engine, bot interface, decision logger
-├── bots/               Bot implementations (Monte Carlo, Poker Mind, ML, RL, CFR, ICM, Exploitative, GTO, Opponent Model)
-│   ├── cfr_bot.py              Monte Carlo CFR bot
-│   ├── icm_bot.py              Tournament equity (ICM) bot
-│   ├── exploitative_bot.py     Exploitative opponent-tracking bot
-│   ├── gto_bot.py              GTO approximation bot
-│   └── opponent_model_bot.py   Bayesian opponent-modeling bot
-├── models/             Neural network architecture and saved model weights (.pt)
-├── training/           Training scripts for ML and RL bots
-│   ├── train_rl_bot.py         Original fixed-opponent curriculum (random → heuristic → MC)
-│   ├── train_rl_bot_mixed.py   Mixed opponent curriculum (weighted heuristic/MC pool)
-│   ├── train_rl_bot_selfplay.py Self-play curriculum (random → heuristic → self-play)
-│   └── train_cfr_bot.py        Pure self-play CFR training (MCCFR, Nash convergence)
-├── data/               Training datasets
-├── logs/               Auto-generated decision logs (JSONL)
-├── output/             Tournament charts and visualizations
-├── run_tournament.py        Live tournament UI (matplotlib)
-├── run_local_match.py       Single tournament runner
-└── run_tournament_stats.py  Batch tournament statistics
+├── core/                          Game engine, bot interface, decision logger
+│   ├── engine.py                  Full hand lifecycle, hand evaluator, pot distribution
+│   ├── bot_api.py                 Action, PlayerView, BotAdapter interfaces
+│   └── logger.py                  Per-decision JSONL logger for ML training
+│
+├── bots/                          Nine bot implementations + factory
+│   ├── __init__.py                Bot factory (create_bot, parse_players, escalate_blinds)
+│   ├── monte_carlo_bot.py         Monte Carlo rollout equity estimation
+│   ├── poker_mind_bot.py          Heuristic hand-tier classification (SmartBot)
+│   ├── ml_bot.py                  Supervised learning (26-feature MLP)
+│   ├── rl_bot.py                  PPO with GAE-lambda and value network
+│   ├── cfr_bot.py                 Monte Carlo CFR (MCCFR, regret matching)
+│   ├── icm_bot.py                 Tournament equity (Independent Chip Model)
+│   ├── exploitative_bot.py        Opponent-tracking exploitation
+│   ├── gto_bot.py                 GTO approximation with balanced mixed strategies
+│   └── opponent_model_bot.py      Bayesian hand-range modeling
+│
+├── models/                        Network definitions and saved weights
+│   ├── poker_mlp.py               PokerMLP architecture (3-layer feedforward)
+│   ├── five_card_table.pkl        Precomputed hand evaluator lookup (~45 MB)
+│   ├── cfr_regret.pkl             Heads-up CFR regret table (~13 MB)
+│   ├── cfr_regret_deep.pkl        Multiway/deep-stack CFR regret table (~13 MB)
+│   └── cfr_regret_pre_migration.pkl  Legacy backup (~13 MB)
+│
+├── training/                      Training scripts for ML, RL, and CFR bots
+│   ├── train_ml_bot.py            Supervised learning on decision logs
+│   ├── train_rl_bot.py            Fixed-opponent curriculum (random -> heuristic -> MC -> self-play)
+│   ├── train_rl_bot_mixed.py      Mixed opponent curriculum (weighted pool, no demotion)
+│   ├── train_rl_bot_selfplay.py   Self-play curriculum (random -> heuristic -> self-play)
+│   ├── train_deep_rl_bot.py       4-player table training (CFR + MC + GTO opponents)
+│   ├── train_cfr_bot.py           Heads-up self-play CFR training
+│   ├── train_cfr_finetune.py      CFR fine-tuning against real opponent bots
+│   └── train_cfr_bot_multiway.py  4-player deep-stack CFR training
+│
+├── logs/                          Auto-generated JSONL decision logs
+├── output/                        Tournament charts (.png) and stats (.csv)
+├── data/                          Training datasets (currently empty)
+│
+├── run_tournament.py              Live tournament UI (matplotlib, Play button)
+├── run_local_match.py             Single tournament runner with chart output
+├── run_tournament_stats.py        Batch statistics with multiprocessing
+└── requirements.txt               Python dependencies
 ```
 
-### core/
+## Core Engine
 
-The game engine (`engine.py`) handles the full hand lifecycle: blinds, betting rounds, street transitions, showdowns, and pot distribution. Includes a pure-Python hand evaluator. `bot_api.py` defines the `Action`, `PlayerView`, and `BotAdapter` interfaces that all bots implement. `logger.py` writes per-decision JSONL logs used for ML training.
+The game engine (`core/engine.py`) handles the full hand lifecycle: blinds, betting rounds (preflop through river), street transitions, showdowns, side pots, and pot distribution. It includes a pure-Python hand evaluator backed by a precomputed lookup table covering all 2,598,960 five-card combinations (~45 MB, built once and cached to `models/five_card_table.pkl`).
 
-### bots/
+`core/bot_api.py` defines the three interfaces all bots implement: `Action` (type + optional amount), `PlayerView` (read-only game state without opponent hole cards), and `BotAdapter` (requires `act(state) -> Action`).
 
-All bot implementations live here. Each bot implements an `act(state) -> Action` method. The runner scripts import directly from this folder.
+`core/logger.py` writes per-decision JSONL logs used for ML training. Each entry captures hand ID, player, hole cards, board, pot, action chosen, and legal actions.
 
-### models/
+## Player Specs
 
-Contains the `PokerMLP` network definition (`poker_mlp.py`) and any saved model weights (`ml_model.pt`, `rl_model.pt`) produced by training.
+Bots are created via string keys passed to `create_bot()` or as comma-separated specs to `parse_players()`:
 
-### training/
+| Key | Bot | Notes |
+|-----|-----|-------|
+| `mc`, `mc<N>` | MonteCarloBot | Optional sim count: `mc200`, `mc500` (default 200) |
+| `smart` | SmartBot | Also accepts `smartbot`, `heuristic` |
+| `ml` | MLBot | Also accepts `mlbot` |
+| `rl`, `rl:<path>` | RLBot | Optional model path: `rl:models/custom.pt` |
+| `cfr` | CFRBot | Loads `models/cfr_regret_deep.pkl` in inference mode |
+| `icm` | ICMBot | Also accepts `icmbot` |
+| `exploitative` | ExploitativeBot | Also accepts `exploitativebot` |
+| `gto` | GTOBot | Also accepts `gtobot` |
+| `opponentmodel` | OpponentModelBot | Also accepts `opponentmodelbot` |
+| `random` | RandomBot | Uniform random legal actions |
 
-Scripts to train the ML, RL, and CFR bots. All scripts add the project root to `sys.path` so they can be run from anywhere. Three separate scripts cover different RL training strategies and one dedicated script trains the CFR bot — see the **Training Scripts** section below for guidance on which to use.
-
-### logs/
-
-Decision logs generated during games. Each session creates a timestamped `.jsonl` file with every bot decision (hole cards, board, pot, action chosen, legal actions). These feed directly into ML training.
+Example: `--players mc200,smart,rl,cfr` creates a 4-player table with auto-assigned IDs (P1-P4). Named seats: `--players P1=mc200,P2=smart`.
 
 ## Bots
 
 ### Monte Carlo Bot
 
-The strongest bot. Runs Monte Carlo simulations (default 200) to estimate equity against random opponent hands, then compares that equity to pot odds. Adjusts aggression thresholds by table position -- tighter early, looser on the button. No learning required, just brute-force probability.
+Runs Monte Carlo simulations (default 200) to estimate equity against random opponent hands, then compares equity to pot odds. Adjusts aggression thresholds by table position (tighter early, looser on the button). No learning required, just brute-force probability. The strongest pure heuristic bot.
 
-### Poker Mind Bot (SmartBot)
+### SmartBot (Poker Mind Bot)
 
-A heuristic bot that doesn't simulate anything. Preflop, it classifies hands into tiers (premium pairs, broadway cards, trash) and adjusts for position. Postflop, it uses the hand evaluator to estimate strength on a 0-1 scale and plays accordingly: bet strong hands, check/call medium ones, fold weak ones. Has a small bluff frequency built in.
+A heuristic bot that classifies hands into tiers (premium pairs, broadway cards, trash) preflop and uses the hand evaluator to estimate strength on a 0-1 scale postflop. Plays accordingly: bet strong hands, check/call medium ones, fold weak ones. Has a small bluff frequency (~7%) built in. Fast baseline reference.
 
 ### ML Bot
 
-Supervised learning bot using a small feedforward network (PokerMLP, 26 input features, 128 hidden units, 6 output classes). Trained on decision logs from other bots -- it learns to imitate their play. Features include hand strength, pot odds, position, and opponent memory (aggression/tightness/VPIP tracked during the session). Falls back to a hand-strength heuristic when the model is untrained or confidence is low.
+Supervised learning bot using a 3-layer feedforward network (PokerMLP: 26 input features, 128 hidden units, 6 output action classes). Trained on decision logs from other bots. Features include hand strength, pot odds, position, and opponent memory (aggression, tightness, VPIP tracked from the last 10 observed actions per opponent). Falls back to a hand-strength heuristic when the model is untrained or confidence is low.
 
-Train it:
 ```bash
 python training/train_ml_bot.py --log_dir logs --epochs 8
-
-# Learn from a specific bot's decisions
 python training/train_ml_bot.py --log_dir logs --filter_players P3
-
-# Only train on winning hands
 python training/train_ml_bot.py --log_dir logs --filter_winners
 ```
 
 ### RL Bot
 
-Reinforcement learning bot using Proximal Policy Optimization (PPO) with Generalized Advantage Estimation (GAE-lambda). Learns through trial and error by playing thousands of games. Uses a deeper network (512 hidden units, dropout) with the same 26-feature input as the ML bot, plus a separate value network for the critic. Rewards are normalized chip deltas for proportional credit assignment. Supports three different training modes via three separate scripts — see **Training Scripts** below.
+Reinforcement learning bot using Proximal Policy Optimization (PPO) with Generalized Advantage Estimation (GAE-lambda). Uses a 512-unit policy network with dropout and a separate 512-unit value network (critic). Same 26-feature input as the ML bot. Rewards are normalized chip deltas for proportional credit assignment, with terminal bonuses for wins/losses. Exploration rate is fixed at 10% during training. Supports four training modes via separate scripts (see Training Scripts below).
 
-Train it:
 ```bash
-# Original fixed-opponent curriculum (random -> heuristic -> Monte Carlo)
 python training/train_rl_bot.py --episodes 50000 --curriculum
-
-# Mixed opponent curriculum (weighted heuristic/MC pool, no demotion)
 python training/train_rl_bot_mixed.py --episodes 50000
-
-# Self-play curriculum (random -> heuristic -> self-play snapshots)
 python training/train_rl_bot_selfplay.py --episodes 50000
+python training/train_deep_rl_bot.py --episodes 50000
 ```
-
-All three scripts save models to `models/`.
 
 ### CFR Bot
 
-Game-theoretic bot using Monte Carlo Counterfactual Regret Minimization (MCCFR). Rather than learning from trial and error, it iteratively reduces regret across sampled game trajectories until its strategy converges toward a Nash equilibrium. Unlike the RL bot, it does not use a neural network — instead it maintains a persistent regret table that updates across hands within a session.
+Game-theoretic bot using Monte Carlo Counterfactual Regret Minimization (MCCFR). Iteratively reduces regret across sampled game trajectories until its strategy converges toward a Nash equilibrium. Maintains a persistent regret table (not a neural network) that updates across hands.
 
 Key design details:
-- **Bet abstraction**: actions are bucketed into 33% pot, 67% pot, pot, and all-in bets, keeping the information state space tractable.
-- **Card abstraction**: hole cards and board texture are mapped to hand-strength buckets rather than exact ranks/suits.
-- **Regret table**: stored in memory and optionally persisted to disk between sessions so the strategy improves over multiple runs.
-- Converges toward Nash equilibrium over time — the more iterations, the closer to optimal play.
+- **Card abstraction**: 10 preflop buckets (hand-strength tiers) and 10 postflop buckets (Monte Carlo equity percentiles from 20 rollouts).
+- **Bet abstraction**: 6 abstract actions (fold, check/call, 33% pot, 67% pot, pot, all-in).
+- **Action history**: compressed into 8-character tokens (F/K/C/S/M/P/A) for information-set keys.
+- **Regret table**: persisted to disk between sessions so the strategy improves over multiple runs.
+- **Inference mode**: skips online regret updates to avoid corrupting loaded strategies during play.
 
-Save and load the regret table:
-```python
-from bots.cfr_bot import CFRBot
-
-bot = CFRBot(iterations=1000)
-bot.save("models/cfr_regret.pkl")   # persist regret table
-
-bot2 = CFRBot()
-bot2.load("models/cfr_regret.pkl")  # resume from saved state
-```
+Three saved profiles exist: `cfr_regret.pkl` (heads-up), `cfr_regret_deep.pkl` (multiway/deep-stack, used by default at inference), and `cfr_regret_pre_migration.pkl` (legacy backup).
 
 ### ICM Bot
 
-Tournament equity-aware bot using Malmuth-Harville Independent Chip Model (ICM) calculations. Rather than maximising chip EV directly, it estimates each player's tournament equity from current stack sizes and makes decisions that maximise equity preservation. Plays aggressively with a large stack (targeting short-stacked opponents) and tightens up when its own stack is threatened.
-
-Key: `icm` (or `icmbot`).
+Tournament equity-aware bot using Malmuth-Harville Independent Chip Model (ICM) calculations. Converts chip stacks into tournament equity (prize shares) and makes decisions that maximize equity preservation rather than raw chip EV. Plays aggressively with a large stack and tightens up when its own stack is at risk.
 
 ### Exploitative Bot
 
-Adapts its strategy mid-session by tracking per-opponent statistics: Voluntarily Put in Pot (VPIP), aggression factor, and fold-to-aggression rate. For new opponents (fewer than 10 hands of history) it falls back to tight-aggressive (TAG) defaults. Once sufficient data is collected it exploits detected tendencies — bluffing against players who fold too much, value-betting against calling stations, and trapping against hyper-aggressors. Statistics are updated after every hand.
-
-Key: `exploitative` (or `exploitativebot`).
+Adapts mid-session by tracking per-opponent statistics: VPIP, aggression factor (AF), and fold-to-aggression rate (FTA). Falls back to tight-aggressive (TAG) defaults until it has 5+ hands of history on an opponent, then exploits detected tendencies: bluffs against high-FTA players, value-bets against calling stations, and traps against hyper-aggressors.
 
 ### GTO Bot
 
-Approximates Game Theory Optimal play using position-aware preflop hand range charts and balanced mixed strategies postflop. Continuation bet frequency, check-raise frequency, and river bet sizing all target a 2:1 value-to-bluff ratio. Non-determinism is achieved via `random.random()` so the bot never plays a fixed, exploitable line.
-
-Key: `gto` (or `gtobot`).
+Approximates Game Theory Optimal play using position-aware preflop hand-range charts (early, mid, late, blinds) and balanced mixed strategies postflop. Targets a 2:1 value-to-bluff ratio on the river. Continuation-bet frequency (60-70%), check-raise frequency (12-18%), and probe bets are all tuned for balance. Non-deterministic by design.
 
 ### Opponent Model Bot
 
-Bayesian hand-range modeling bot. Maintains a probability distribution over five hand-strength buckets (trash, weak, medium, strong, premium) for each opponent and updates those distributions using likelihood multipliers derived from observed actions (bets, raises, checks, folds). At decision time it runs Monte Carlo equity estimation against the weighted opponent range rather than against random hands, producing more accurate pot-odds calculations as the hand progresses.
-
-Key: `opponentmodel` (or `opponentmodelbot`).
+Bayesian hand-range modeling. Maintains a probability distribution over five hand-strength buckets (trash, weak, medium, strong, premium) per opponent and updates via likelihood multipliers from observed actions. Runs Monte Carlo equity against the weighted opponent range rather than random hands for more accurate pot-odds calculations as the hand progresses.
 
 ## Training Scripts
 
-Three scripts train the RL bot with different opponent curricula. All share the same PPO update loop, GAE-lambda advantage estimation, logging, and CLI arguments.
+### RL Training
 
-### train_rl_bot.py
-Fixed-opponent curriculum. Two modes:
-- **Without `--curriculum`**: trains against a fixed opponent (default: montecarlo). Fast for `heuristic` or `self`, but **very slow against montecarlo** (200 simulations per decision).
-- **With `--curriculum`**: walks through **random → heuristic → montecarlo → self-play**. Note that the montecarlo stage is **extremely slow in practice** due to simulation cost per decision. Recommended only if you have significant compute time.
+Four scripts train the RL bot with different strategies. All share the same PPO update loop, GAE-lambda, and CLI arguments.
 
-### train_rl_bot_mixed.py
-Mixed opponent curriculum (weighted heuristic/MC pool). Smoother curriculum with no demotion as win rate improves.
+**train_rl_bot.py** -- Fixed-opponent curriculum with optional promotion/demotion. Walks through random, heuristic, Monte Carlo, and self-play stages. The Monte Carlo stage is very slow (200 sims per opponent decision). Supports `--curriculum` flag.
 
-### train_rl_bot_selfplay.py
-**Recommended training script.** Three-stage curriculum: **random → heuristic → self-play** (skips Monte Carlo entirely for speed). Loads from `models/rl_model_run2.pt` if available, saves final model to `models/rl_model_run3.pt`.
+**train_rl_bot_mixed.py** -- Mixed opponent curriculum with continuous weight shifts between heuristic and Monte Carlo opponents (initial 80/20, shifting 5% per threshold crossing). Includes survival bonuses and early-elimination penalties in reward shaping. No demotion. Transitions to self-play when MC weight reaches 80%.
 
-**Typical progression**: train with `train_rl_bot_selfplay.py` for the fastest results, or start with `train_rl_bot.py` without `--curriculum` for a stable baseline, then continue with `train_rl_bot_mixed.py` once the bot can beat Monte Carlo.
+**train_rl_bot_selfplay.py** -- **Recommended for fastest results.** Three-stage curriculum: random, heuristic, self-play (skips Monte Carlo entirely). Gracefully handles checkpoint loading across architecture changes (256 to 512 hidden units). Saves snapshots every 500 episodes during self-play. Loads from `models/rl_model_run2.pt`, saves to `models/rl_model_run3.pt`.
 
-### train_cfr_bot.py
-Dedicated self-play training script for the CFR bot. A single CFRBot instance plays both seats simultaneously, building a shared regret table from both perspectives on every hand — the theoretically correct approach for Nash convergence. Saves the regret table to `models/cfr_regret.pkl` periodically and resumes automatically from that file if it exists on startup.
+**train_deep_rl_bot.py** -- 4-player table training. Pits the RL bot against CFR, Monte Carlo (200 sims), and GTO opponents simultaneously with random seat assignment each episode. No curriculum stages. Faster LR decay (every 20K episodes vs 30K). Best used after the bot has a solid foundation from one of the other scripts.
+
+### CFR Training
+
+**train_cfr_bot.py** -- Heads-up self-play. A single CFRBot plays both seats, building a shared regret table from both perspectives (theoretically correct for Nash convergence). Expected outcome: ~50% win rate. Saves to `models/cfr_regret.pkl`.
 
 ```bash
-# Default: 50,000 episodes at 200 MCCFR rollouts per decision
 python training/train_cfr_bot.py
-
-# Higher quality (slower)
 python training/train_cfr_bot.py --tournaments 100000 --iterations 500
-
-# Resume from a previous run or save to a custom path
 python training/train_cfr_bot.py --profile models/cfr_v2.pkl
+```
+
+**train_cfr_bot_multiway.py** -- 4-player deep-stack training (1000 chips, 5/10 blinds, 1.5x escalation every 50 hands). Four CFR instances share one regret table. Saves to `models/cfr_regret_deep.pkl`.
+
+**train_cfr_finetune.py** -- Phase 2 fine-tuning. Loads a pre-trained profile and refines it against real bots (smart, mc100) in 4-player games. Reduced iterations (50 vs 200) for speed. Defaults to overwriting the input profile.
+
+### ML Training
+
+**train_ml_bot.py** -- Supervised learning on JSONL decision logs. Trains PokerMLP with Adam optimizer, ReduceLROnPlateau scheduler, 80/20 train/val split. Supports filtering by player (`--filter_players`) or winning hands only (`--filter_winners`). Requires decision logs in `logs/` (generate by running tournaments with logging enabled).
+
+```bash
+python training/train_ml_bot.py --log_dir logs --epochs 8
 ```
 
 ## Adding a Bot
@@ -214,8 +216,17 @@ from core.bot_api import Action, PlayerView
 
 class MyBot:
     def act(self, state: PlayerView) -> Action:
-        # state has: hole_cards, board, pot, to_call, legal_actions, stacks, position, etc.
+        # state has: hole_cards, board, pot, to_call, legal_actions,
+        #            stacks, position, history, etc.
         return Action("call")
 ```
 
-Then add it to whichever runner script you want to use.
+Then register it in `bots/__init__.py` by adding a key-to-import mapping in `create_bot()`.
+
+## Known Limitations
+
+- **No web UI** -- visualization is matplotlib-only (local).
+- **CFR abstraction** -- 10 postflop buckets and 20 equity rollouts are coarse; finer abstractions would improve play quality at the cost of training time and memory.
+- **ML bot feature alignment** -- there are minor mismatches between feature encoding at training time and inference time (normalization, memory windowing) that can reduce model effectiveness.
+- **Exploration decay** -- the RL bot's exploration rate (10%) is fixed; a decay schedule would help the bot sharpen its play in later training stages.
+- **No position encoding in CFR info-sets** -- the CFR bot doesn't distinguish between positions (BTN vs BB) when building its strategy, limiting its ability to learn position-dependent play.
