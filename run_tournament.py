@@ -40,8 +40,8 @@ from bots import parse_players, escalate_blinds
 
 DEFAULT_PLAYERS = "mc200,smart,ml,rl,cfr,icm,exploitative,gto,opponentmodel"
 DEFAULT_CHIPS   = 1000
-DEFAULT_SB      = 5
-DEFAULT_BB      = 10
+DEFAULT_SMALLBLIND = 5
+DEFAULT_BIGBLIND   = 10
 DEFAULT_DELAY   = 0.05
 DEFAULT_BLIND_INCREASE_EVERY = 50
 
@@ -910,10 +910,10 @@ def main():
                         help=f"Comma-separated bot types (default: {DEFAULT_PLAYERS})")
     parser.add_argument("--chips", type=int, default=DEFAULT_CHIPS,
                         help=f"Starting chips (default: {DEFAULT_CHIPS})")
-    parser.add_argument("--sb", type=int, default=DEFAULT_SB,
-                        help=f"Starting small blind (default: {DEFAULT_SB})")
-    parser.add_argument("--bb", type=int, default=DEFAULT_BB,
-                        help=f"Starting big blind (default: {DEFAULT_BB})")
+    parser.add_argument("--sb", type=int, default=DEFAULT_SMALLBLIND,
+                        help=f"Starting small blind (default: {DEFAULT_SMALLBLIND})")
+    parser.add_argument("--bb", type=int, default=DEFAULT_BIGBLIND,
+                        help=f"Starting big blind (default: {DEFAULT_BIGBLIND})")
     parser.add_argument("--delay", type=float, default=DEFAULT_DELAY,
                         help=f"Initial delay between hands in seconds (default: {DEFAULT_DELAY})")
     parser.add_argument("--blind-increase-every", type=int,

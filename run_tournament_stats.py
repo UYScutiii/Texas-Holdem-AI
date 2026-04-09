@@ -5,6 +5,7 @@ import csv
 import io
 import os
 import random
+import time as _time
 from collections import defaultdict
 from contextlib import redirect_stdout
 from multiprocessing import Pool
@@ -98,6 +99,22 @@ def run_silent_tournament(args_tuple):
 
 # ── Batch runner ──────────────────────────────────────────────────────────────
 
+# ── GUI code run in a subprocess (macOS requires tkinter on the main thread) ──
+
+_G   = "\033[92m"
+_B   = "\033[1m"
+_R   = "\033[0m"
+_W   = 40
+
+
+def _bar(done, total):
+    filled = int(_W * done / total) if total else 0
+    pct    = done / total * 100 if total else 0
+    bar    = "█" * filled + "░" * (_W - filled)
+    print(f"\r  {_G}{_B}[{bar}]{_R} {_G}{pct:5.1f}%{_R}  {done}/{total}",
+          end="", flush=True)
+
+
 def run_tournament_batch(player_spec_str, num_tournaments, chips, base_sb, base_bb,
                          blind_increase_every, max_hands, parallel, output_csv, seed):
     player_specs = parse_players(player_spec_str)
@@ -128,20 +145,18 @@ def run_tournament_batch(player_spec_str, num_tournaments, chips, base_sb, base_
 
     # Run tournaments
     results = []
+    _bar(0, num_tournaments)
     if parallel > 1:
         with Pool(processes=parallel) as pool:
             for i, res in enumerate(pool.imap_unordered(run_silent_tournament, tasks), 1):
                 results.append(res)
-                if i % 5 == 0 or i == num_tournaments:
-                    print(f"  Completed {i}/{num_tournaments}...")
+                _bar(i, num_tournaments)
     else:
         for i, task in enumerate(tasks, 1):
             res = run_silent_tournament(task)
             results.append(res)
-            if i % 5 == 0 or i == num_tournaments:
-                winner = res["winner"]
-                hands = res["hand_count"]
-                print(f"  Tournament {i}/{num_tournaments} — Winner: {winner} ({hands} hands)")
+            _bar(i, num_tournaments)
+    print()
 
     # ── Aggregate statistics ──────────────────────────────────────────────────
 
@@ -261,10 +276,10 @@ def main():
     parser = argparse.ArgumentParser(
         description="Run multiple Texas Hold'em tournaments and track statistics")
     parser.add_argument("--players", type=str,
-                        default="rl,ml,smart,mc200,mc100",
-                        help="Comma-separated bot types (default: rl,ml,smart,mc200,mc100)")
-    parser.add_argument("--tournaments", type=int, default=30,
-                        help="Number of tournaments (default: 30)")
+                        default="smart,cfr,gto,icm,exploitative,opponentmodel,mc200",
+                        help="Comma-separated bot types (default: smart,cfr,gto,icm,exploitative,opponentmodel,mc200)")
+    parser.add_argument("--tournaments", type=int, default=100,
+                        help="Number of tournaments (default: 100)")
     parser.add_argument("--chips", type=int, default=500,
                         help="Starting chips per player (default: 500)")
     parser.add_argument("--sb", type=int, default=1,
