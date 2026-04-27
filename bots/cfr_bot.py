@@ -5,9 +5,11 @@ A simplified MCCFR agent for No-Limit Texas Hold'em that converges
 toward a Nash equilibrium strategy over time.
 
 Key design choices:
-  * Bet abstraction – four sizing buckets: 33% pot, 67% pot, pot, all-in.
+  * Bet abstraction – six sizing buckets: 33/50/67/75/100% pot + all-in.
   * Card abstraction – preflop hand-strength tiers (10 buckets) and
     postflop hand-strength percentile bins (10 buckets).
+  * Position abstraction – 4 positional buckets (early/middle/late/blinds).
+  * SPR abstraction – 3 stack-to-pot ratio buckets (low/mid/high).
   * External-sampling MCCFR with regret-matching.
   * Strategy profile + cumulative regret tables persist across hands
     within a session and can be serialised to disk.
@@ -24,6 +26,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from core.bot_api import Action, PlayerView
 from core.engine import eval_hand, _FULL_DECK, EVAL_HAND_MAX
+from core.equity import equity as _canonical_equity
+from core.equity import equity_bucket as _canonical_equity_bucket
+from core.action_history import ActionEvent, tokenize as _canonical_tokenize
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  Constants
@@ -37,19 +42,63 @@ ABSTRACT_ACTIONS: List[str] = [
     "fold",
     "check_call",     # check when no bet, call when facing a bet
     "bet_33",         # bet / raise 33% of pot
+    "bet_50",         # bet / raise 50% of pot (half-pot)
     "bet_67",         # bet / raise 67% of pot
+    "bet_75",         # bet / raise 75% of pot (three-quarter pot)
     "bet_100",        # bet / raise 100% of pot (pot-sized)
     "all_in",         # shove
 ]
 NUM_ACTIONS = len(ABSTRACT_ACTIONS)
 
 # Number of Monte Carlo rollouts for postflop hand-strength estimation
-_HS_SIMS = 20
+_HS_SIMS = 100
 
 # Number of preflop buckets (hand-strength tiers)
-_PREFLOP_BUCKETS = 10
+_PREFLOP_BUCKETS = 20
 # Number of postflop buckets (hand-strength percentile ranges)
-_POSTFLOP_BUCKETS = 10
+_POSTFLOP_BUCKETS = 20
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Position & SPR abstraction helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# Map engine position labels into 4 strategic buckets so CFR can learn
+# different opening/calling ranges for each seat category.
+_POSITION_BUCKETS = {
+    # Late position: most info, widest range
+    "BTN": "late", "CO": "late", "HJ": "late",
+    # Middle position
+    "MP": "middle", "LJ": "middle",
+    # Early position: tightest range
+    "UTG": "early", "UTG+1": "early", "UTG+2": "early",
+    # Blinds: posted dead money, last to act preflop
+    "SB": "blinds", "BB": "blinds",
+}
+
+
+def _position_bucket(position: str) -> str:
+    """Compress engine position label into one of 4 strategic buckets."""
+    return _POSITION_BUCKETS.get(position, "middle")  # safe fallback
+
+
+def _spr_bucket(hero_stack: int, pot: int, opp_stacks: list) -> str:
+    """
+    Classify the effective stack-to-pot ratio.
+
+    Effective stack = min(hero, biggest active opponent) — that's the
+    most chips that can actually be wagered between us.
+    """
+    if pot <= 0:
+        # Preflop before blinds posted — treat as deep
+        return "high"
+    effective = hero_stack
+    if opp_stacks:
+        effective = min(hero_stack, max(opp_stacks))
+    spr = effective / pot
+    if spr < 5:    return "low"     # commitment/stack-off territory
+    if spr < 15:   return "mid"     # standard play
+    return "high"                   # deep, implied odds matter
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -91,61 +140,38 @@ def _preflop_bucket(hole: List[Tuple[str, str]]) -> int:
 
 
 def _postflop_bucket(hole: List[Tuple[str, str]],
-                     board: List[Tuple[str, str]]) -> int:
+                     board: List[Tuple[str, str]],
+                     n_opponents: int) -> int:
     """
-    Estimate hand-strength percentile via Monte-Carlo rollout, then
-    bucket into one of ``_POSTFLOP_BUCKETS`` bins.
+    Estimate hand-strength percentile via Monte-Carlo rollout against
+    ``n_opponents`` random hands, then bucket into one of
+    ``_POSTFLOP_BUCKETS`` bins.
+
+    In multiway pots hero must beat ALL opponents to "win".
 
     Returns an integer in [0, _POSTFLOP_BUCKETS-1] where higher = stronger.
+
+    Delegates to core.equity.equity_bucket for the canonical implementation.
     """
-    if not hole or len(hole) < 2 or not board:
-        return _POSTFLOP_BUCKETS // 2  # neutral bucket
-
-    used = set(tuple(c) for c in hole) | set(tuple(c) for c in board)
-    remaining = [c for c in _FULL_DECK if c not in used]
-
-    wins = 0
-    total = 0
-
-    for _ in range(_HS_SIMS):
-        if len(remaining) < 2:
-            break
-        opp_hand = random.sample(remaining, 2)
-        # Complete board to 5 cards if needed
-        opp_set = {tuple(opp_hand[0]), tuple(opp_hand[1])}
-        rest = [c for c in remaining if tuple(c) not in opp_set]
-        need = 5 - len(board)
-        if need > 0:
-            if len(rest) < need:
-                continue
-            extra = random.sample(rest, need)
-            full_board = list(board) + extra
-        else:
-            full_board = list(board)
-
-        my_score = eval_hand(list(hole), full_board)
-        opp_score = eval_hand(opp_hand, full_board)
-
-        if my_score > opp_score:
-            wins += 1
-        elif my_score == opp_score:
-            wins += 0.5
-        total += 1
-
-    if total == 0:
-        return _POSTFLOP_BUCKETS // 2
-
-    equity = wins / total
-    bucket = int(equity * _POSTFLOP_BUCKETS)
-    return max(0, min(_POSTFLOP_BUCKETS - 1, bucket))
+    return _canonical_equity_bucket(
+        hole, board, n_opponents,
+        n_buckets=_POSTFLOP_BUCKETS, n_sims=_HS_SIMS,
+    )
 
 
-def _info_set_key(street: str, bucket: int, history_key: str) -> str:
+def _info_set_key(street: str, bucket: int, history_key: str,
+                  n_opponents: int, position_bucket: str,
+                  spr_bucket: str) -> str:
     """
-    Build a compact information-set key from the street, card bucket, and
-    abstracted action history.
+    Build a compact information-set key from the street, active opponent
+    count, position bucket, SPR bucket, card bucket, and abstracted
+    action history.
+
+    Including all dimensions means CFR learns separate strategies for
+    different positions, stack depths, and table sizes.
     """
-    return f"{street}:{bucket}:{history_key}"
+    return (f"{street}:{n_opponents}:{position_bucket}"
+            f":{spr_bucket}:{bucket}:{history_key}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -174,20 +200,24 @@ def _legal_abstract_actions(legal: List[Dict[str, Any]],
         spec = next(a for a in legal if a["type"] in ("bet", "raise"))
         lo, hi = spec["min"], spec["max"]
 
-        # Generate the four sizing targets
+        # Generate the six sizing targets (indices match ABSTRACT_ACTIONS)
         sizes = {
             2: int(pot * 0.33),   # bet_33
-            3: int(pot * 0.67),   # bet_67
-            4: int(pot * 1.00),   # bet_100
-            5: hi,                # all_in
+            3: int(pot * 0.50),   # bet_50
+            4: int(pot * 0.67),   # bet_67
+            5: int(pot * 0.75),   # bet_75
+            6: int(pot * 1.00),   # bet_100
+            7: hi,                # all_in
         }
 
+        seen_amts = set()
         for idx, target in sizes.items():
-            # Clamp target into [lo, hi] and accept it
+            # Clamp target into [lo, hi], then skip duplicate concrete bets.
             clamped = max(lo, min(hi, target))
-            # Avoid duplicates when multiple targets collapse to the same value
-            if idx not in result:
-                result.append(idx)
+            if clamped in seen_amts:
+                continue
+            seen_amts.add(clamped)
+            result.append(idx)
 
     return sorted(set(result)) if result else [1]  # fallback: check/call
 
@@ -216,7 +246,10 @@ def _abstract_to_concrete(abstract_idx: int,
         return _fallback_passive(legal)
 
     # Sizing actions
-    frac_map = {"bet_33": 0.33, "bet_67": 0.67, "bet_100": 1.00, "all_in": None}
+    frac_map = {
+        "bet_33": 0.33, "bet_50": 0.50, "bet_67": 0.67,
+        "bet_75": 0.75, "bet_100": 1.00, "all_in": None,
+    }
     frac = frac_map.get(label)
 
     bet_raise = [a for a in legal if a["type"] in ("bet", "raise")]
@@ -255,35 +288,30 @@ def _abstract_history(history: List[Dict[str, Any]], pot: int) -> str:
     Compress the engine action history into a compact string of abstract
     action labels suitable for use as an information-set key suffix.
 
-    Each action is mapped to one of our 6 abstract action labels.
+    Delegates to core.action_history.tokenize for the canonical
+    implementation. Constructs ActionEvent objects from raw history
+    dicts, using pot_before from the engine (falls back to current pot
+    for old-format histories).
+
+    Tokens:
+      F = fold, K = check, C = call,
+      S = small (~33%), Q = quarter-pot-ish (~50%),
+      M = medium (~67%), L = large (~75%),
+      P = pot-sized (~100%), A = all-in / over-pot
     """
-    tokens: List[str] = []
+    events = []
     for entry in history:
         atype = entry.get("type", "")
-        # Fold / check / call → direct mapping
-        if atype == "fold":
-            tokens.append("F")
-        elif atype == "check":
-            tokens.append("K")
-        elif atype == "call":
-            tokens.append("C")
-        elif atype in ("bet", "raise"):
-            amt = entry.get("amount") or 0
-            if pot > 0:
-                ratio = amt / pot
-            else:
-                ratio = 1.0
-            if ratio >= 0.9:
-                tokens.append("A")   # all-in / pot+
-            elif ratio >= 0.8:
-                tokens.append("P")   # pot-sized
-            elif ratio >= 0.5:
-                tokens.append("M")   # ~67%
-            else:
-                tokens.append("S")   # ~33%
-        else:
-            tokens.append("?")
-    return "".join(tokens)
+        amt = entry.get("amount") or 0
+        ref_pot = entry.get("pot_before", pot)
+        events.append(ActionEvent(
+            seat=0,  # seat not used by tokenizer
+            street=entry.get("street", "preflop"),
+            action=atype if atype else "check",
+            amount=int(amt),
+            pot_before=int(ref_pot),
+        ))
+    return _canonical_tokenize(events)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -418,6 +446,14 @@ class CFRBot:
         legal = state.legal_actions
         street = state.street
         history = state.history or []
+        hero_stack = int(state.stacks.get(state.me, 0))
+        call_amount = max(0, int(to_call))
+
+        # How many opponents are still active (not folded)?  The engine's
+        # PlayerView.opponents already excludes folded players.
+        n_opp = len(state.opponents) if state.opponents else 1
+        n_opp = max(1, n_opp)  # at least 1 opponent for the math to work
+
         # Bail fast if we have no cards (shouldn't happen, but be safe)
         if not hole or len(hole) < 2:
             return _fallback_passive(legal)
@@ -426,13 +462,26 @@ class CFRBot:
         if street == "preflop":
             bucket = _preflop_bucket(hole)
         else:
-            bucket = _postflop_bucket(hole, board)
+            bucket = _postflop_bucket(hole, board, n_opponents=n_opp)
 
         # ── History abstraction ─────────────────────────────────
         hist_key = _abstract_history(history, pot)
 
-        # ── Information-set key ─────────────────────────────────
-        info_key = _info_set_key(street, bucket, hist_key)
+        # ── Position & SPR abstraction ──────────────────────────
+        pos_b = _position_bucket(state.position)
+        # Collect active opponent stacks for effective-stack calculation
+        opp_stacks = [
+            int(state.stacks.get(o, 0))
+            for o in (state.opponents or [])
+            if int(state.stacks.get(o, 0)) > 0
+        ]
+        spr_b = _spr_bucket(hero_stack, pot, opp_stacks)
+
+        # ── Information-set key (includes opponent count, position, SPR) ──
+        info_key = _info_set_key(street, bucket, hist_key,
+                                 n_opponents=n_opp,
+                                 position_bucket=pos_b,
+                                 spr_bucket=spr_b)
 
         # ── Legal abstract actions ──────────────────────────────
         legal_mask = _legal_abstract_actions(legal, pot)
@@ -441,7 +490,10 @@ class CFRBot:
         # Running iterations during live play corrupts the loaded regret
         # table with noise from the simplified value function.
         if not self.inference_mode:
-            self._run_iterations(info_key, legal_mask, pot, hole, board, street)
+            self._run_iterations(info_key, legal_mask, pot, hole, board,
+                                 street, n_opponents=n_opp,
+                                 call_amount=call_amount,
+                                 hero_stack=hero_stack)
 
         # ── Choose action from strategy ─────────────────────────
         node = self._nodes.get(info_key)
@@ -450,7 +502,7 @@ class CFRBot:
         # table): fall back to an equity-based heuristic rather than
         # uniform random, which is what a blank _CFRNode would give.
         if node is None or sum(node.strategy_sum) == 0.0:
-            equity = self._quick_equity(hole, board)
+            equity = self._quick_equity(hole, board, n_opponents=n_opp)
             return self._heuristic_action(legal_mask, equity, pot, to_call, legal)
 
         if self.use_average:
@@ -476,6 +528,9 @@ class CFRBot:
         hole: List[Tuple[str, str]],
         board: List[Tuple[str, str]],
         street: str,
+        n_opponents: int,
+        call_amount: int,
+        hero_stack: int,
     ):
         """
         Run ``self.iterations`` simplified MCCFR traversals rooted at the
@@ -490,7 +545,7 @@ class CFRBot:
 
         # Compute equity once per decision point (outside the iteration loop)
         # so that the Monte-Carlo rollout is not repeated on every iteration.
-        equity = self._quick_equity(hole, board)
+        equity = self._quick_equity(hole, board, n_opponents=n_opponents)
 
         for _ in range(self.iterations):
             strategy = node.get_strategy(legal_mask)
@@ -502,7 +557,14 @@ class CFRBot:
             # Compute utility for each legal abstract action via rollout
             action_values = {}
             for a in legal_mask:
-                action_values[a] = self._estimate_action_value(a, pot, equity)
+                action_values[a] = self._estimate_action_value(
+                    a,
+                    pot,
+                    equity,
+                    n_opponents=n_opponents,
+                    call_amount=call_amount,
+                    hero_stack=hero_stack,
+                )
 
             # Expected value under current strategy
             ev = sum(strategy[a] * action_values.get(a, 0.0) for a in legal_mask)
@@ -519,98 +581,77 @@ class CFRBot:
         abstract_idx: int,
         pot: int,
         equity: float,
+        n_opponents: int,
+        call_amount: int,
+        hero_stack: int,
     ) -> float:
         """
-        Estimate the expected value of taking the given abstract action.
+        Estimate the chip EV of taking the given abstract action.
 
-        Reference point: fold = 0.0 (neutral — we stop investing chips).
-        All other values are relative to this baseline.
-
-          * fold      → 0.0  (give up the hand, lose no more chips)
-          * check/call→ equity - 0.5  (positive when favourite, negative when underdog)
-          * bet/raise → blend of fold equity (win pot uncontested) and showdown EV
-
-        ``equity`` is a pre-computed Monte-Carlo equity estimate in [0, 1].
+        Fold is the neutral reference point. Other actions are scored in
+        chips, then normalized by pot size so regrets stay comparable across
+        short-stack and deep-stack spots.
         """
         label = ABSTRACT_ACTIONS[abstract_idx]
+        pot = max(0, int(pot))
+        hero_stack = max(0, int(hero_stack))
+        call_amount = max(0, int(call_amount))
 
         if label == "fold":
             # Neutral reference point — we stop putting chips in.
             return 0.0
 
         if label == "check_call":
-            # Positive when equity > 50%, negative when underdog.
-            # At 30% equity → -0.2 (worse than folding → correct).
-            return equity - 0.5
+            if call_amount == 0:
+                # Free check: no extra risk, so we realize our pot share.
+                ev = equity * pot
+            else:
+                # Calling pays only the amount we can cover.
+                cost = min(call_amount, hero_stack)
+                ev = equity * (pot + cost) - (1.0 - equity) * cost
+            return ev / max(pot, 1)
 
         # Bet / raise actions
-        frac_map = {"bet_33": 0.33, "bet_67": 0.67, "bet_100": 1.00, "all_in": 2.0}
+        frac_map = {
+            "bet_33": 0.33, "bet_50": 0.50, "bet_67": 0.67,
+            "bet_75": 0.75, "bet_100": 1.00, "all_in": 2.0,
+        }
         sizing_frac = frac_map.get(label, 0.5)
+        bet_size = min(sizing_frac * pot, hero_stack)
 
-        # Conservative fold equity: larger bets induce more folds, capped at 30%.
-        fold_equity = min(0.30, 0.18 * sizing_frac)
+        # Bigger bets generate more folds, but with diminishing returns.
+        fold_equity = min(0.45, 0.20 * sizing_frac ** 0.7)
 
-        # Showdown value (same scale as check_call baseline).
-        showdown_value = equity - 0.5
+        # If everyone folds, we win the pot that already exists.
+        fold_value = pot
 
-        # Winning the pot uncontested is a small but real gain.
-        fold_gain = 0.25
+        # If called, villain matches the bet. We can win the larger pot,
+        # but we must subtract the chips we invested.
+        called_pot = pot + 2 * bet_size
+        called_value = equity * called_pot - bet_size
 
-        value = fold_equity * fold_gain + (1.0 - fold_equity) * showdown_value
+        # Large bets are volatile; keep a simple chip-risk penalty.
+        risk_penalty = 0.05 * bet_size
 
-        # Small risk penalty for large bets to discourage reckless shoves.
-        value -= 0.02 * min(sizing_frac, 1.5)
+        ev = fold_equity * fold_value + (1.0 - fold_equity) * called_value
+        ev -= risk_penalty
 
-        return value
+        return ev / max(pot, 1)
 
     def _quick_equity(
         self,
         hole: List[Tuple[str, str]],
         board: List[Tuple[str, str]],
+        n_opponents: int,
     ) -> float:
         """
-        Fast equity estimate against one random opponent.
-        Uses fewer simulations than the bucketing function for speed.
+        Fast Monte-Carlo equity estimate against ``n_opponents`` random
+        opponents.
+
+        Delegates to core.equity.equity for the canonical implementation.
+        Uses 100 sims for tighter MC estimates (~±0.022 noise).
         """
-        if not hole or len(hole) < 2:
-            return 0.5
-
-        # Preflop: use the bucket as a rough equity proxy
-        if not board:
-            bucket = _preflop_bucket(hole)
-            return 0.3 + 0.5 * (bucket / (_PREFLOP_BUCKETS - 1))
-
-        used = set(tuple(c) for c in hole) | set(tuple(c) for c in board)
-        remaining = [c for c in _FULL_DECK if c not in used]
-
-        wins = 0
-        total = 0
-        sims = 20  # fewer sims for speed during MCCFR iterations
-
-        for _ in range(sims):
-            if len(remaining) < 2:
-                break
-            opp = random.sample(remaining, 2)
-            opp_set = {tuple(opp[0]), tuple(opp[1])}
-            rest = [c for c in remaining if tuple(c) not in opp_set]
-            need = 5 - len(board)
-            if need > 0 and len(rest) < need:
-                continue
-            if need > 0:
-                extra = random.sample(rest, need)
-                fb = list(board) + extra
-            else:
-                fb = list(board)
-
-            my_s = eval_hand(list(hole), fb)
-            op_s = eval_hand(opp, fb)
-            if my_s > op_s:
-                wins += 1
-            elif my_s == op_s:
-                wins += 0.5
-            total += 1
-
-        return wins / total if total > 0 else 0.5
+        return _canonical_equity(hole, board, n_opponents, n_sims=100)
 
     def _heuristic_action(
         self,
@@ -717,17 +758,35 @@ class CFRBot:
         try:
             with open(path, "rb") as f:
                 data = pickle.load(f)
-            self._nodes = {
+            loaded_nodes = {
                 k: _CFRNode.from_dict(v) for k, v in data["nodes"].items()
+            }
+            # Keys must have >= 5 colons to match the current format:
+            # street:n_opp:position:spr:bucket:history
+            self._nodes = {
+                k: node for k, node in loaded_nodes.items()
+                if k.count(":") >= 5
             }
             self._hands_played = data.get("hands_played", 0)
             self._total_iterations = data.get("total_iterations", 0)
+            dropped = len(loaded_nodes) - len(self._nodes)
+            if dropped:
+                print(
+                    f"[CFRBot] Dropped {dropped} old-format keys "
+                    f"(pre-position/SPR). {len(self._nodes)} valid keys remain."
+                )
+                if not self._nodes:
+                    print(
+                        "  ⚠ Profile has no valid keys for current code. Bot will fall back\n"
+                        "    to heuristic until a fresh profile is trained."
+                    )
             print(f"[CFRBot] Loaded profile from {path} "
                   f"({len(self._nodes)} info sets, "
                   f"{self._total_iterations} iterations)")
         except Exception as e:
             print(f"[CFRBot] Could not load profile from {path}: {e}")
             self._nodes = {}
+            return
 
     # ──────────────────────────────────────────────────────────────────────────
     #  Diagnostics

@@ -19,6 +19,7 @@ import math
 from itertools import combinations
 from core.bot_api import Action, PlayerView
 from core.engine import eval_hand, EVAL_HAND_MAX, _FULL_DECK
+from core.icm import equities as _core_icm_equities
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -30,15 +31,9 @@ def icm_equity(stacks: dict[str, int]) -> dict[str, float]:
     Compute each player's Independent Chip Model equity as a fraction
     of the total prize pool (normalised to 1.0).
 
-    Uses the Malmuth-Harville model: the probability a player finishes in
-    a given position is proportional to their stack / remaining stacks,
-    iterated recursively for each finishing position.
+    Uses the Malmuth-Harville model via core.icm.equities.
 
-    For a flat payout structure (everyone gets the same share), ICM equity
-    equals stack fraction.  For a typical tournament with top-heavy payouts,
-    short stacks have *more* equity per chip than big stacks.
-
-    We use a flat payout here (every place pays 1/N equally) so that the
+    We use a top-heavy payout structure (decay 0.6) so that the
     ICM pressure curve is entirely driven by stack-size risk aversion —
     big stacks can afford to gamble, short stacks cannot.
 
@@ -52,56 +47,19 @@ def icm_equity(stacks: dict[str, int]) -> dict[str, float]:
     if n == 1:
         return {pid: (1.0 if stacks[pid] > 0 else 0.0) for pid in stacks}
 
-    chip_total = sum(stacks[p] for p in players)
-    if chip_total == 0:
-        eq = 1.0 / n
-        return {pid: (eq if pid in players else 0.0) for pid in stacks}
-
     # Top-heavy payout structure: each place pays ~60% of the place above.
-    # This creates real ICM pressure — 1st is worth fighting for, last is
-    # nearly worthless, so short stacks genuinely can't afford to gamble.
     decay = 0.6
     raw = [decay ** i for i in range(n)]
     total = sum(raw)
     payouts = [p / total for p in raw]  # payouts[0] = 1st place
 
-    # Compute probabilities of finishing in each position via recursion.
-    equity = {pid: 0.0 for pid in stacks}
+    # Build ordered list for core.icm
+    all_pids = list(stacks.keys())
+    stacks_list = [stacks[pid] for pid in all_pids]
 
-    def _recurse(remaining: list[str], remaining_total: int, payout_idx: int):
-        """
-        For each remaining player, compute their probability of finishing
-        in position `payout_idx`, multiply by that position's payout, and
-        recurse for the remaining positions.
-        """
-        if payout_idx >= len(payouts) or not remaining:
-            return
-        if len(remaining) == 1:
-            # Last player gets all remaining payouts
-            pid = remaining[0]
-            for i in range(payout_idx, len(payouts)):
-                equity[pid] += payouts[i]
-            return
+    eq_list = _core_icm_equities(stacks_list, payouts)
 
-        for pid in remaining:
-            prob = stacks[pid] / remaining_total if remaining_total > 0 else 1.0 / len(remaining)
-            equity[pid] += prob * payouts[payout_idx]
-
-            # Recurse: remove this player, compute rest
-            new_remaining = [p for p in remaining if p != pid]
-            new_total = remaining_total - stacks[pid]
-            _recurse(new_remaining, new_total, payout_idx + 1)
-
-    # Limit recursion depth for large fields (exact ICM is O(N!) but for
-    # typical 6-9 player tables it's fine).
-    if n <= 8:
-        _recurse(players, chip_total, 0)
-    else:
-        # Approximation for huge tables: equity ≈ stack fraction
-        for pid in players:
-            equity[pid] = stacks[pid] / chip_total
-
-    return equity
+    return {pid: eq_list[i] for i, pid in enumerate(all_pids)}
 
 
 def icm_ev_of_call(
