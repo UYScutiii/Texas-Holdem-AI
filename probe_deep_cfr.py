@@ -221,16 +221,21 @@ def _preflop_health(stats):
 
 # ── Failure-mode gate (--fail-on-unhealthy) ─────────────────────────────────
 #
-# Hard thresholds that flag the all-in-collapse signature.  A metric "trips"
-# when it is >= its threshold.  These are coarse health bounds, not a strength
-# eval — a checkpoint can clear them and still play poorly.  Tuned to fail the
-# known-collapsed checkpoint (preflop all-in ~28%, PFR ~53%, avg raise ~37x,
-# strong all-in ~54%) while passing a non-collapsed preflop strategy.
+# Hard thresholds that flag the two known collapse signatures.  Most metrics are
+# "high is bad" — a metric trips when value >= threshold (the all-in-collapse
+# signature).  ``strong_continue_min`` is the lone "low is bad" gate: it trips
+# when the strong-hand continue rate falls BELOW the threshold (the fold-collapse
+# signature, Key Change #2 aftermath — AA/KK/AKs folded ~100%).  These are coarse
+# health bounds, not a strength eval — a checkpoint can clear them and still play
+# poorly.  Tuned to fail the known all-in collapse (preflop all-in ~28%, PFR ~53%,
+# avg raise ~37x, strong all-in ~54%) AND the known fold collapse (strong continue
+# ~0%) while passing a non-collapsed preflop strategy.
 UNHEALTHY_THRESHOLDS = {
     "preflop_all_in": 8.0,    # % of preflop random spots that shove
     "preflop_pfr": 40.0,      # % preflop raise frequency
     "preflop_avg_raise": 10.0,  # avg preflop bet/raise in pots
     "strong_all_in": 25.0,    # % of AA/KK/AKs spots that shove
+    "strong_continue_min": 80.0,  # % of AA/KK/AKs spots that continue (low=bad)
 }
 
 
@@ -238,23 +243,36 @@ def _avg_size(stats):
     return sum(stats["sizes"]) / len(stats["sizes"]) if stats["sizes"] else 0.0
 
 
-def _evaluate_health(pre, strong, thresholds=None):
-    """Return [(label, value, threshold, tripped)] for the failure-mode gate.
+def _strong_continue_pct(strong):
+    """% of strong-hand spots that continue (check/call/bet/raise/all_in)."""
+    return _pct(strong["total"] - strong["fold"], strong["total"])
 
-    ``tripped`` is True when value >= threshold (the unhealthy direction).
+
+def _evaluate_health(pre, strong, thresholds=None):
+    """Return [(label, value, threshold, direction, tripped)] for the gate.
+
+    ``direction`` is ``"high"`` (unhealthy when value >= threshold, the
+    all-in-collapse signature) or ``"low"`` (unhealthy when value < threshold,
+    the fold-collapse signature).  ``tripped`` applies that comparison.
     """
     t = thresholds or UNHEALTHY_THRESHOLDS
     metrics = [
         ("preflop all-in %", _pct(pre["all_in"], pre["total"]),
-         t["preflop_all_in"]),
+         t["preflop_all_in"], "high"),
         ("preflop PFR %", _pct(pre["pfr"], pre["total"]),
-         t["preflop_pfr"]),
+         t["preflop_pfr"], "high"),
         ("avg preflop raise (x pot)", _avg_size(pre),
-         t["preflop_avg_raise"]),
+         t["preflop_avg_raise"], "high"),
         ("strong-hand all-in %", _pct(strong["all_in"], strong["total"]),
-         t["strong_all_in"]),
+         t["strong_all_in"], "high"),
+        ("strong-hand continue %", _strong_continue_pct(strong),
+         t["strong_continue_min"], "low"),
     ]
-    return [(label, value, thr, value >= thr) for label, value, thr in metrics]
+    rows = []
+    for label, value, thr, direction in metrics:
+        tripped = value >= thr if direction == "high" else value < thr
+        rows.append((label, value, thr, direction, tripped))
+    return rows
 
 
 def _print_health_gate(pre, strong):
@@ -264,9 +282,13 @@ def _print_health_gate(pre, strong):
     print("HEALTH GATE (--fail-on-unhealthy)")
     print("=" * 72)
     tripped_any = False
-    for label, value, thr, tripped in rows:
+    for label, value, thr, direction, tripped in rows:
         mark = "FAIL" if tripped else "OK"
-        op = ">=" if tripped else "<"
+        # ``op`` describes value-vs-threshold so the reader sees why it tripped.
+        if direction == "high":
+            op = ">=" if tripped else "<"
+        else:
+            op = "<" if tripped else ">="
         print(f"  {mark}: {label:<28} {value:7.2f}  ({op} {thr:.1f})")
         tripped_any = tripped_any or tripped
     healthy = not tripped_any
@@ -373,11 +395,12 @@ def run_probe(args):
     _print_stats("A. Preflop random spots", pre, healthy=_preflop_health)
     _print_stats("B. Postflop random flop spots", post)
 
-    strong_play = _pct(strong["vpip"], strong["total"])
+    strong_hand_continue_pct = _strong_continue_pct(strong)
     _print_stats("C. Strong-hand sanity (AA/KK/AKs late position)", strong)
-    print(f"Strong-hand continue/raise/call rate: {strong_play:5.1f}%")
-    print(("OK" if strong_play >= 80 else "FLAG") +
-          ": target is >80% continuing strong hands")
+    print(f"strong_hand_continue_pct: {strong_hand_continue_pct:5.1f}%  "
+          f"(continue = check/call/bet/raise/all_in)")
+    print(("OK" if strong_hand_continue_pct >= 80 else "FLAG") +
+          ": target is >=80% continuing strong hands (below = fold collapse)")
     print()
 
     trash_fold = _pct(trash["fold"], trash["total"])
@@ -431,8 +454,9 @@ def parse_args():
     parser.add_argument(
         "--fail-on-unhealthy", action="store_true",
         help="Exit nonzero if preflop all-in >= 8%%, preflop PFR >= 40%%, avg "
-             "preflop raise >= 10x pot, or strong-hand all-in >= 25%%. Prints a "
-             "HEALTH GATE section; normal probe output is otherwise unchanged.",
+             "preflop raise >= 10x pot, strong-hand all-in >= 25%%, or "
+             "strong-hand continue < 80%% (fold collapse). Prints a HEALTH GATE "
+             "section; normal probe output is otherwise unchanged.",
     )
     return parser.parse_args()
 

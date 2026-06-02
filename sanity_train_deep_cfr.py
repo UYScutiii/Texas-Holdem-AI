@@ -932,9 +932,44 @@ try:
         print("  [FAIL] — live-canary metric classification wrong")
         PASS = False
 
-    # Deferred enforcement: the extra metrics (PFR/avg-raise/strong-all-in) must
-    # NOT change the status before iteration >= deploy_iteration, but MUST once
-    # the model is mature.  A clean all-in canary + a PFR-over-fail metric:
+    # Fold-collapse gate: strong_continue is the lone LOW-is-bad extra metric
+    # (Key Change #2 aftermath — AA/KK/AKs folded ~100%).  Bands: PASS at
+    # >= 80%, WARN in [60%, 80%), FAIL below 60%; the boundaries are pinned
+    # exactly.  A missing key must default to HEALTHY (PASS) — a 0.0 default
+    # would spuriously FAIL every legacy two-key probe.  The failure reason must
+    # NAME the metric (strong_continue) so a fold-collapse abort is attributable
+    # separately from an all-in collapse.
+    sc_pass = classify_extra_canary_metrics({"strong_continue": 0.80})[0]
+    sc_warn_hi = classify_extra_canary_metrics({"strong_continue": 0.799})[0]
+    sc_warn_lo = classify_extra_canary_metrics({"strong_continue": 0.60})[0]
+    sc_fail = classify_extra_canary_metrics({"strong_continue": 0.599})[0]
+    sc_zero_status, sc_zero_reasons, _ = classify_extra_canary_metrics(
+        {"strong_continue": 0.0})
+    sc_missing = classify_extra_canary_metrics({})[0]
+    sc_names = any("strong_continue" in r for r in sc_zero_reasons)
+    # Combined gate: a clean all-in canary + a fold-collapsed strong continue
+    # must still drive the overall checkpoint status to FAIL.
+    combined_fold_fail = _worst_canary_status(
+        classify_canary(0.0, 0.0),
+        classify_extra_canary_metrics({"strong_continue": 0.0})[0],
+    )
+    print(f"  strong_continue: 80%->{sc_pass}, 79.9%->{sc_warn_hi}, "
+          f"60%->{sc_warn_lo}, 59.9%->{sc_fail}, missing->{sc_missing}, "
+          f"reason={sc_zero_reasons}, "
+          f"combined(clean all-in + 0%)->{combined_fold_fail}")
+    if (sc_pass == "PASS" and sc_warn_hi == "WARN" and sc_warn_lo == "WARN"
+            and sc_fail == "FAIL" and sc_zero_status == "FAIL" and sc_names
+            and sc_missing == "PASS" and combined_fold_fail == "FAIL"):
+        print("  [PASS] — strong_continue classifies PASS>=80/WARN 60-80/FAIL<60, "
+              "names the metric, defaults healthy, and forces overall FAIL")
+    else:
+        print("  [FAIL] — strong_continue fold-collapse classification wrong")
+        PASS = False
+
+    # Deferred enforcement: the extra metrics (PFR/avg-raise/strong-all-in/
+    # strong-continue) must NOT change the status before iteration >=
+    # deploy_iteration, but MUST once the model is mature.  A clean all-in canary
+    # + a PFR-over-fail metric:
     #   - early (iter < deploy)  -> PASS (reported only, no false abort)
     #   - mature (iter >= deploy)-> FAIL
     # The always-enforced all-in canary is unaffected by the deploy boundary.
@@ -953,6 +988,26 @@ try:
               "all-in canary still FAILs pre-deploy")
     else:
         print("  [FAIL] — deferred extra-metric enforcement wrong")
+        PASS = False
+
+    # The fold-collapse metric follows the SAME deferral, and an all-in collapse
+    # must still FAIL independently (proving the two signatures are separable in
+    # the live canary, not just the probe): a clean all-in canary + 0%
+    # strong_continue is reported-only (PASS) pre-deploy and FAIL once mature.
+    fold_metrics = {"raw_all_in": 0.0, "search_all_in": 0.0, "strong_continue": 0.0}
+    fold_early = decide_canary_status(fold_metrics, iteration=DEPLOY - 1, deploy_iteration=DEPLOY)
+    fold_mature = decide_canary_status(fold_metrics, iteration=DEPLOY, deploy_iteration=DEPLOY)
+    print(f"  fold deferral: strong_continue=0% "
+          f"early(status,enforced)=({fold_early[0]},{fold_early[5]}), "
+          f"mature=({fold_mature[0]},{fold_mature[5]}); "
+          f"all-in collapse early(independent)={allin_early[0]}")
+    if (fold_early[0] == "PASS" and fold_early[5] is False
+            and fold_mature[0] == "FAIL" and fold_mature[5] is True
+            and allin_early[0] == "FAIL"):
+        print("  [PASS] — strong_continue enforcement deferred to iter >= deploy; "
+              "all-in collapse still FAILs independently")
+    else:
+        print("  [FAIL] — deferred strong_continue enforcement wrong")
         PASS = False
 except Exception as e:
     print(f"  [FAIL] — exception: {type(e).__name__}: {e}")

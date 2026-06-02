@@ -54,13 +54,22 @@ CANARY_FAIL_RAW_MIN = 0.60
 # all-in canary above (mirrors probe_deep_cfr.py --fail-on-unhealthy).  A metric
 # WARNs at its *_WARN level (side checkpoint only) and FAILs/aborts at its *_FAIL
 # level; the overall checkpoint status is the worst of the all-in canary and
-# these.  PFR / strong-all-in are fractions in [0,1]; avg-raise is in x-pot.
+# these.  PFR / strong-all-in / strong-continue are fractions in [0,1]; avg-raise
+# is in x-pot.
+#
+# All of these except strong-continue are "high is bad" (trip when value >= the
+# level).  ``strong_continue`` is the lone "low is bad" gate (the fold-collapse
+# signature): it WARNs when continue < WARN and FAILs when continue < FAIL.  Note
+# the WARN level is the HIGHER number for this metric — anything below 80% is at
+# least a WARN, anything below 60% is a FAIL.
 CANARY_PFR_WARN = 0.40
 CANARY_PFR_FAIL = 0.55
 CANARY_AVG_RAISE_WARN = 10.0
 CANARY_AVG_RAISE_FAIL = 25.0
 CANARY_STRONG_ALL_IN_WARN = 0.25
 CANARY_STRONG_ALL_IN_FAIL = 0.45
+CANARY_STRONG_CONTINUE_WARN = 0.80  # continue < this -> at least WARN
+CANARY_STRONG_CONTINUE_FAIL = 0.60  # continue < this -> FAIL (fold collapse)
 
 
 def epsilon_for_iteration(t: int, total: int) -> float:
@@ -332,37 +341,54 @@ def _worst_canary_status(a: str, b: str) -> str:
 
 
 def classify_extra_canary_metrics(metrics: dict) -> tuple[str, list[str], list[str]]:
-    """Classify the PFR / avg-raise / strong-all-in health metrics.
+    """Classify the PFR / avg-raise / strong-all-in / strong-continue metrics.
 
     Returns ``(status, failed, warned)`` where ``status`` is PASS/WARN/FAIL and
     ``failed`` / ``warned`` are human-readable label strings for the
     ``[CANARY]`` / ``[WARN]`` log lines and the abort message.
 
-    Missing keys default to 0.0 (healthy), so a probe that returns only the
+    Each spec carries a ``direction``: ``"high"`` metrics trip when value >= the
+    threshold (the all-in-collapse signature); the lone ``"low"`` metric,
+    ``strong_continue``, trips when value < the threshold (the fold-collapse
+    signature — AA/KK/AKs folded).  The failed/warned reason strings name the
+    specific metric (e.g. ``strong_continue``) so an abort can be attributed to
+    fold collapse vs. all-in collapse.
+
+    Missing keys default to a HEALTHY value so a probe that returns only the
     legacy two-key ``{raw_all_in, search_all_in}`` dict (e.g. the monkeypatched
     probes in sanity_train_deep_cfr / sanity_train_deep_cfr_abort /
     sanity_review_findings) classifies as PASS on these added metrics and the
-    all-in canary alone decides the outcome.
+    all-in canary alone decides the outcome.  For the high-is-bad metrics the
+    healthy default is 0.0; for strong_continue (low-is-bad) it is 1.0 — a 0.0
+    default would spuriously FAIL every legacy probe.
     """
     specs = [
-        ("preflop PFR", metrics.get("preflop_pfr", 0.0),
-         CANARY_PFR_WARN, CANARY_PFR_FAIL, "pct"),
-        ("avg preflop raise", metrics.get("preflop_avg_raise", 0.0),
-         CANARY_AVG_RAISE_WARN, CANARY_AVG_RAISE_FAIL, "x"),
-        ("strong-hand all-in", metrics.get("strong_all_in", 0.0),
-         CANARY_STRONG_ALL_IN_WARN, CANARY_STRONG_ALL_IN_FAIL, "pct"),
+        ("preflop_pfr", metrics.get("preflop_pfr", 0.0),
+         CANARY_PFR_WARN, CANARY_PFR_FAIL, "pct", "high"),
+        ("avg_preflop_raise", metrics.get("preflop_avg_raise", 0.0),
+         CANARY_AVG_RAISE_WARN, CANARY_AVG_RAISE_FAIL, "x", "high"),
+        ("strong_all_in", metrics.get("strong_all_in", 0.0),
+         CANARY_STRONG_ALL_IN_WARN, CANARY_STRONG_ALL_IN_FAIL, "pct", "high"),
+        ("strong_continue", metrics.get("strong_continue", 1.0),
+         CANARY_STRONG_CONTINUE_WARN, CANARY_STRONG_CONTINUE_FAIL, "pct", "low"),
     ]
     failed: list[str] = []
     warned: list[str] = []
-    for label, value, warn_t, fail_t, unit in specs:
+    for label, value, warn_t, fail_t, unit, direction in specs:
         if unit == "pct":
             shown, warn_s, fail_s = (f"{value:.1%}", f"{warn_t:.0%}", f"{fail_t:.0%}")
         else:
             shown, warn_s, fail_s = (f"{value:.1f}x", f"{warn_t:.0f}x", f"{fail_t:.0f}x")
-        if value >= fail_t:
-            failed.append(f"{label}={shown} (>= {fail_s})")
-        elif value >= warn_t:
-            warned.append(f"{label}={shown} (>= {warn_s})")
+        if direction == "high":
+            if value >= fail_t:
+                failed.append(f"{label}={shown} (>= {fail_s})")
+            elif value >= warn_t:
+                warned.append(f"{label}={shown} (>= {warn_s})")
+        else:  # low is bad
+            if value < fail_t:
+                failed.append(f"{label}={shown} (< {fail_s})")
+            elif value < warn_t:
+                warned.append(f"{label}={shown} (< {warn_s})")
     if failed:
         return "FAIL", failed, warned
     if warned:
@@ -551,15 +577,17 @@ def _canary_collect_stats(
 ) -> dict:
     """Run the bot over ``views`` under deterministic inference settings.
 
-    Returns ``{"total", "all_in", "pfr", "sizes"}``.  All bot inference flags,
+    Returns ``{"total", "all_in", "pfr", "continue", "sizes"}``.  All bot inference flags,
     the opponent tracker, the module RNG AND the bot's per-instance RNG
     (``bot._rng``, which drives action sampling) are saved and restored, so
     calling this never perturbs the surrounding training loop.  Both RNGs are
     also seeded from ``seed`` so the probe is fully reproducible for a given
     network — without seeding bot._rng, the sampled actions would still depend
     on the training loop's RNG state at checkpoint time.  ``pfr`` counts any
-    bet/raise/all-in (matching probe_deep_cfr); ``sizes`` collects bet/raise
-    amounts as a fraction of pot (matching probe_deep_cfr's avg-size).
+    bet/raise/all-in (matching probe_deep_cfr); ``continue`` counts any non-fold
+    action (check/call/bet/raise/all_in — the fold-collapse complement); ``sizes``
+    collects bet/raise amounts as a fraction of pot (matching probe_deep_cfr's
+    avg-size).
     """
     old_training = bot.network.training
     old_inference_mode = bot.inference_mode
@@ -574,7 +602,7 @@ def _canary_collect_stats(
     old_random_state = random.getstate()
     old_bot_rng_state = bot._rng.getstate()
 
-    stats = {"total": 0, "all_in": 0, "pfr": 0, "sizes": []}
+    stats = {"total": 0, "all_in": 0, "pfr": 0, "continue": 0, "sizes": []}
     try:
         random.seed(seed)
         bot._rng.seed(seed)
@@ -595,6 +623,8 @@ def _canary_collect_stats(
                 stats["all_in"] += 1
             if action.type in ("bet", "raise", "all_in"):
                 stats["pfr"] += 1
+            if action.type != "fold":
+                stats["continue"] += 1
             if action.type in ("bet", "raise") and action.amount is not None:
                 stats["sizes"].append(action.amount / max(view.pot, 1))
     finally:
@@ -625,7 +655,8 @@ def quick_canary_probe(bot: DeepCFRBot, device: torch.device,
     Keys: ``raw_all_in`` / ``search_all_in`` (the original all-in frequencies,
     numerically unchanged — same views and seeds as before), plus ``preflop_pfr``
     and ``preflop_avg_raise`` (raw policy over the random preflop spots) and
-    ``strong_all_in`` (raw policy over AA/KK/AKs spots).
+    ``strong_all_in`` / ``strong_continue`` (raw policy over AA/KK/AKs spots;
+    ``strong_continue`` is the non-fold rate — the fold-collapse gate).
     """
     _ = device  # kept for call-site/API clarity; bot.act handles device moves.
     views = _canary_views(n, seed)
@@ -642,14 +673,35 @@ def quick_canary_probe(bot: DeepCFRBot, device: torch.device,
         current_iteration=current_iteration,
     )
     n_raw = max(raw["total"], 1)
+    n_strong = max(strong["total"], 1)
     avg_raise = sum(raw["sizes"]) / len(raw["sizes"]) if raw["sizes"] else 0.0
     return {
         "raw_all_in": raw["all_in"] / n_raw,
         "search_all_in": search["all_in"] / max(search["total"], 1),
         "preflop_pfr": raw["pfr"] / n_raw,
         "preflop_avg_raise": avg_raise,
-        "strong_all_in": strong["all_in"] / max(strong["total"], 1),
+        "strong_all_in": strong["all_in"] / n_strong,
+        "strong_continue": strong["continue"] / n_strong,
     }
+
+
+def format_canary_metrics(canary: dict) -> str:
+    """Render the one-line canary metrics summary used by the live
+    ``[CANARY]`` / ``[WARN]`` / abort log lines.
+
+    Pure function of the probe dict so the rendering — which MUST surface
+    ``strong_continue`` (the fold-collapse %) alongside the all-in metrics — is
+    unit-testable without a training run.  ``strong_continue`` defaults to 1.0
+    (healthy) when absent so a legacy two-key probe still renders cleanly.
+    """
+    return (
+        f"search={canary.get('search_all_in', 0.0):.1%}, "
+        f"raw={canary.get('raw_all_in', 0.0):.1%}, "
+        f"PFR={canary.get('preflop_pfr', 0.0):.1%}, "
+        f"avg_raise={canary.get('preflop_avg_raise', 0.0):.1f}x, "
+        f"strong_all_in={canary.get('strong_all_in', 0.0):.1%}, "
+        f"strong_continue={canary.get('strong_continue', 1.0):.1%}"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -757,9 +809,6 @@ def run_training(args) -> dict:
         canary = quick_canary_probe(bot, device, current_iteration=iteration)
         raw_all_in = canary["raw_all_in"]
         search_all_in = canary["search_all_in"]
-        preflop_pfr = canary.get("preflop_pfr", 0.0)
-        preflop_avg_raise = canary.get("preflop_avg_raise", 0.0)
-        strong_all_in = canary.get("strong_all_in", 0.0)
 
         # Overall status combines the original all-in canary with the added
         # health metrics, but the extra metrics are only ENFORCED once the model
@@ -776,14 +825,11 @@ def run_training(args) -> dict:
             bot.all_in_warmup_iterations,
             bot.all_in_full_release_iteration,
         )
-        metrics_str = (
-            f"search={search_all_in:.1%}, raw={raw_all_in:.1%}, "
-            f"PFR={preflop_pfr:.1%}, avg_raise={preflop_avg_raise:.1f}x, "
-            f"strong_all_in={strong_all_in:.1%}"
-        )
+        metrics_str = format_canary_metrics(canary)
         defer_note = "" if extra_enforced else (
-            f" [PFR/avg-raise/strong-all-in reported only, enforced at iter "
-            f">= {bot.all_in_deploy_iteration}; would be {extra_status}]")
+            f" [PFR/avg-raise/strong-all-in/strong-continue reported only, "
+            f"enforced at iter >= {bot.all_in_deploy_iteration}; would be "
+            f"{extra_status}]")
         if status == "FAIL":
             reasons: list[str] = []
             if base_status == "FAIL":
@@ -793,8 +839,11 @@ def run_training(args) -> dict:
                     f"{CANARY_FAIL_RAW_MIN:.0%})")
             if extra_enforced:
                 reasons.extend(extra_failed)
+            # Header is generic ("collapse canary") so a fold-collapse abort
+            # (strong_continue too low) is not mislabeled as an all-in collapse;
+            # the reason list names the specific tripping metric(s).
             raise RuntimeError(
-                f"All-in collapse at iter {iteration}: phase={phase} "
+                f"Collapse canary FAILED at iter {iteration}: phase={phase} "
                 f"{metrics_str} -- FAILED: {'; '.join(reasons)}"
             )
         if status == "WARN":

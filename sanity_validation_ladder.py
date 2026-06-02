@@ -119,6 +119,11 @@ LADDER: list[Gate] = [
     Gate("sanity_deep_cfr_allin_masks", 3, "deep-cfr",
          script="sanity_deep_cfr_allin_curriculum.py", args=["--mode", "fast"],
          timeout=300),
+    # Fold-collapse health gate (post-Key-Change-#2): strong-hand continue
+    # gate in the probe + live training canary.  Training-free, so it runs in
+    # the default fast tier (not gated behind --full).
+    Gate("sanity_deep_cfr_fold_collapse", 3, "deep-cfr",
+         script="sanity_deep_cfr_fold_collapse.py", timeout=180),
 
     # Tier 4 — chip / value accounting (always)
     Gate("sanity_aivat", 4, "all",
